@@ -1,0 +1,1832 @@
+import argparse
+import json
+import asyncio
+import re
+from pathlib import Path
+from utils.async_runner import AsyncLoopThread
+from datasets import load_dataset, Dataset, concatenate_datasets
+from litellm import acompletion
+import logging
+from datetime import datetime, timezone
+import random
+from tqdm import tqdm
+
+ASYNC_LOOP = AsyncLoopThread()
+
+def extract_xml_content(text: str, tag: str):
+    flags = re.DOTALL | 0
+    pattern = rf"<{re.escape(tag)}(?:\s+[^>]*)?\s*>(.*?)</\s*{re.escape(tag)}\s*>"
+
+    last_content = None
+    for m in re.finditer(pattern, text, flags):
+        last_content = m.group(1)
+
+    if last_content is None:
+        return None
+    return last_content.strip()
+
+def find_boxed(pred_str: str):
+    ans = pred_str.split("boxed")[-1]
+    if not ans:
+        return ""
+    if ans[0] == "{":
+        stack = 1
+        a = ""
+        for c in ans[1:]:
+            if c == "{":
+                stack += 1
+                a += c
+            elif c == "}":
+                stack -= 1
+                if stack == 0:
+                    break
+                a += c
+            else:
+                a += c
+    else:
+        a = ans.split("$")[0].strip()
+    return a
+
+def strip_think_simple(s: str) -> str:
+    return re.sub(r"<think\b[^>]*>.*?</think>", "", s, flags=re.DOTALL | re.IGNORECASE)
+
+def get_current_log_path(log_dir: str):
+    ts = datetime.now(timezone.utc).strftime("%m%dT%H%M")
+    logdir = Path(log_dir) / ts
+    return logdir
+
+def _compute_binary_metrics(preds: list[int | None], targets: list[int]) -> dict:
+    """Compute accuracy/precision/recall/F1 for binary predictions.
+
+    When a prediction is ``None`` it is skipped (useful for unresolved samples).
+    """
+    tp = tn = fp = fn = 0
+    total = 0
+    correct = 0
+    for pred, target in zip(preds, targets):
+        if pred is None:
+            continue
+        gt = int(target)
+        total += 1
+        if pred == gt:
+            correct += 1
+        if pred == 1 and gt == 1:
+            tp += 1
+        elif pred == 0 and gt == 0:
+            tn += 1
+        elif pred == 1 and gt == 0:
+            fp += 1
+        elif pred == 0 and gt == 1:
+            fn += 1
+
+    accuracy = (correct / total) if total else None
+    precision = (tp / (tp + fp)) if (tp + fp) else None
+    recall = (tp / (tp + fn)) if (tp + fn) else None
+    f1 = ((2 * precision * recall / (precision + recall))
+          if (precision is not None and recall is not None and (precision + recall))
+          else None)
+    return {
+        "total": total,
+        "accuracy": accuracy,
+        "tp": tp,
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
+
+def save_progressive_iteration_samples(
+    logdir: Path,
+    iteration_logs: list[dict],
+    problems: list[str],
+    proofs: list[str],
+    stripped_proofs: list[str],
+    summaries: list[dict] | None = None,
+    costs: list[dict] | None = None,
+    prefix: str = "progressive",
+):
+    if not iteration_logs:
+        return
+    summary_map = {entry.get("iteration_index"): entry for entry in (summaries or [])}
+    cost_map = {entry.get("iteration_index"): entry for entry in (costs or [])}
+    for entry in iteration_logs:
+        iteration_index = entry.get("iteration_index")
+        samples_payload = []
+        for sample in entry.get("samples", []):
+            sample_idx = sample.get("sample_index")
+            record = dict(sample)
+            if isinstance(sample_idx, int) and 0 <= sample_idx < len(problems):
+                record.update({
+                    "problem": problems[sample_idx],
+                    "proof": proofs[sample_idx],
+                    "stripped_proof": stripped_proofs[sample_idx],
+                })
+            samples_payload.append(record)
+
+        payload = {
+            "iteration_index": iteration_index,
+            "summary": summary_map.get(iteration_index),
+            "cost": cost_map.get(iteration_index),
+            "samples": samples_payload,
+        }
+        out_path = logdir / f"{prefix}_iteration_{iteration_index}_samples.json"
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+
+def _load_jsonl_problems(jsonl_path: Path, content_keys: tuple[str, ...] = ("markdown_statement",)) -> list[str]:
+    """Load problems from a JSONL file.
+
+    Each line must be a JSON object. The text of the problem is extracted
+    from the first available key in `content_keys`.
+    """
+    logger = logging.getLogger("dataset")
+    problems: list[str] = []
+    with jsonl_path.open("r", encoding="utf-8") as f:
+        for i, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                logger.warning("Skipping malformed JSON at %s line %d", jsonl_path, i)
+                continue
+            content = None
+            for key in content_keys:
+                if key in obj and isinstance(obj[key], str):
+                    content = obj[key]
+                    break
+            if content is None:
+                logger.warning("No problem content key %s found at %s line %d", content_keys, jsonl_path, i)
+                continue
+            problems.append(content)
+    logger.info("Loaded %d problems from %s", len(problems), jsonl_path)
+    return problems
+
+# For dataset decryption purposes!
+def _derive_keystream(canary: str, length: int) -> bytes:
+    import hashlib
+    from math import ceil
+    digest = hashlib.sha256(canary.encode("utf-8")).digest()
+    if length <= len(digest):
+        return digest[:length]
+    repeats = ceil(length / len(digest))
+    return (digest * repeats)[:length]
+
+def _xor_bytes(data: bytes, key_stream: bytes) -> bytes:
+    if len(data) != len(key_stream):
+        raise ValueError("Data and keystream must be the same length for XOR.")
+    return bytes([a ^ b for a, b in zip(data, key_stream)])
+
+def _deserialize_field(text: str):
+    try:
+        parsed = json.loads(text)
+        return parsed
+    except Exception:
+        return text
+
+
+def decrypt_str(input_str, canary):
+    import base64
+    if input_str == "":
+        return ""
+    ct = base64.b64decode(input_str)
+    ks = _derive_keystream(canary, len(ct))
+    pt = _xor_bytes(ct, ks)
+    text = pt.decode("utf-8")
+    return _deserialize_field(text)
+
+def decrypt_h2eval_sample(example):
+    if "canary" not in example:
+        raise ValueError("Missing canary field `canary`.")
+    canary = example["canary"]
+    if not isinstance(canary, str):
+        raise ValueError("Canary should be a string.")
+
+    target_fields = ["question", "model_response_by_step", "human_labels", "human_labels_first_error_idx"]
+    for k, v in example.items():
+        if k in target_fields and isinstance(v, str):
+            try:
+                example[k] = decrypt_str(v, canary)
+            except Exception:
+                example[k] = v
+
+    return example
+
+def prepare_dataset(dataset_path):
+    """
+    this function prepares datasets according to the given path
+    """
+    logger = logging.getLogger("dataset")
+    logger.info("preparing dataset at path: %s", dataset_path)
+    if dataset_path == "NP_dataset/train_full.json" or dataset_path == "NP_dataset/train_3000.json" or dataset_path == "NP_dataset/test_hard.json" or dataset_path == "NP_dataset/test_random.json" or dataset_path == "NP_dataset/train_300.json":
+        with Path(dataset_path).open("r", encoding="utf-8") as f:
+            problems = json.load(f)
+        ds = Dataset.from_dict({"problem": problems})
+    elif dataset_path in {
+        "NP_dataset/qz_bench_train.jsonl",
+        "NP_dataset/qz_bench_eval.jsonl",
+    }:
+        problems = _load_jsonl_problems(Path(dataset_path), content_keys=("markdown_statement",))
+        ds = Dataset.from_dict({"problem": problems})
+    elif dataset_path == "NP_dataset/gradingbench.csv":
+        ds = load_dataset("csv", data_files=dataset_path)
+        ds = ds["train"].select(range(300))
+        ds = ds.rename_column("Problem", "problem")
+        ds = ds.rename_column("Response", "proof")
+        gt_evals = [int(e["Points"]) > 6 for e in ds]
+        ds = ds.add_column("gt_eval", gt_evals)
+    elif dataset_path == "HuggingFaceH4/MATH-500":
+        ds = load_dataset(dataset_path)
+        ds = ds.remove_columns(["solution"])
+        ds = ds["test"]
+    elif dataset_path == "AIME24/25":
+        ds24 = load_dataset("Maxwell-Jia/AIME_2024")
+        ds24 = ds24["train"]
+        ds24 = Dataset.from_dict(
+            {
+                "problem": [e["Problem"] for e in ds24],
+                "answer": [str(e["Answer"]) for e in ds24]
+            }
+        )
+        ds25_1 = load_dataset("opencompass/AIME2025", "AIME2025-I")
+        ds25_2 = load_dataset("opencompass/AIME2025", "AIME2025-II")
+        ds25 = concatenate_datasets([ds25_1['test'], ds25_2['test']])
+        ds25 = Dataset.from_dict(
+            {
+                "problem": [e["question"] for e in ds25],
+                "answer": [e["answer"] for e in ds25]
+            }
+        )
+        ds = concatenate_datasets([ds24, ds25])
+    elif dataset_path == "Salesforce/Hard2Verify":
+        ds = load_dataset(dataset_path, split="test")
+        ds = ds.map(decrypt_h2eval_sample)
+        ds = ds.rename_column("question", "problem")
+        proofs = ["\n".join(e["model_response_by_step"]) for e in ds]
+        ds = ds.add_column("proof", proofs)
+        gt_evals = [e["human_labels_first_error_idx"] < 0 for e in ds]
+        ds = ds.add_column("gt_eval", gt_evals)
+    else:
+        raise NotImplementedError(f"Unknown dataset name or path: {dataset_path}")
+
+    logger.info("completed preparing dataset at: %s", dataset_path)
+
+    return ds
+
+class LLMClient():
+    def __init__(self, api_base, api_key, model):
+        self.api_base = api_base
+        self.api_key = api_key
+        self.model = model
+        self.input_tokens = []
+        self.comp_tokens = []
+        self.last_input_tokens = []
+        self.last_comp_tokens = []
+
+    def _supports_enable_thinking(self) -> bool:
+        model_name = (self.model or "").lower()
+        return "deepseek" in model_name or "qwen" in model_name
+
+    async def _infer_one(self,
+                         messages,
+                         sem: asyncio.Semaphore,
+                         **kwargs):
+        backoff = 1.0
+        while True:
+            try:
+                async with sem:
+                    resp = await acompletion(
+                        model="openai/"+self.model,
+                        messages=messages,
+                        api_base=self.api_base,
+                        api_key=self.api_key,
+                        drop_params=True,
+                        temperature=1.0,
+                        timeout=3600,
+                        num_retries=7,
+                        **kwargs)
+                return resp
+            except Exception as e:
+                msg = str(e).lower()
+                if any(k in msg for k in ["rate", "timeout", "overloaded", "temporarily"]):
+                    await asyncio.sleep(backoff + random.random() * 0.2)
+                    backoff = min(backoff * 2, 60)
+                    continue
+                # raise
+                return None
+
+    async def infer_batch_async(self,
+                                all_messages,
+                                concurrency: int = 8,
+                                show_progress: bool = True,
+                                **kwargs) -> list[str]:
+        logger = logging.getLogger("evaluator")
+        logger.info("running batch inference on %d samples", len(all_messages))
+        sem = asyncio.Semaphore(concurrency)
+        ALLOWED_PARAM_KEYS = {"reasoning_effort", "thinking"}
+        infer_params = {k: v for k, v in kwargs.items() if k in ALLOWED_PARAM_KEYS}
+        enable_thinking = kwargs.get("enable_thinking")
+        if enable_thinking is not None and self._supports_enable_thinking():
+            infer_params["enable_thinking"] = enable_thinking
+        async def _run_one(index: int, messages):
+            try:
+                r = await self._infer_one(messages, sem, **infer_params)
+            except Exception as e:
+                r = e
+            return index, r
+
+        tasks = [asyncio.create_task(_run_one(i, messages)) for i, messages in enumerate(all_messages)]
+        raw_results = [None] * len(all_messages)
+
+        pbar = tqdm(total=len(all_messages), desc="LLM batch", leave=False) if show_progress else None
+        try:
+            for t in asyncio.as_completed(tasks):
+                idx, r = await t
+                raw_results[idx] = r
+                if pbar:
+                    pbar.update(1)
+        finally:
+            if pbar:
+                pbar.close()
+
+        for i, r in enumerate(raw_results):
+            if isinstance(r, Exception):
+                raise RuntimeError(f"Task {i} failed") from r
+        logger.info("completed batch inference on %d samples",  len(all_messages))
+        completions = [r.choices[0].message["content"] if r is not None else "" for r  in raw_results]
+        batch_input_tokens = [r.usage.prompt_tokens for r in raw_results if r is not None]
+        batch_comp_tokens = [r.usage.completion_tokens for r in raw_results if r is not None]
+        self.last_input_tokens = batch_input_tokens
+        self.last_comp_tokens = batch_comp_tokens
+        self.input_tokens.extend(batch_input_tokens)
+        self.comp_tokens.extend(batch_comp_tokens)
+        return completions
+
+class Verifier():
+    def __init__(self, api_base, api_key, model):
+        self.client = LLMClient(api_base, api_key, model)
+
+    def __call__(self, problems, completions, **kwargs):
+        all_messages = [
+            [
+                {"role": "system", "content": (
+                    "You are an assistant highly proficient in mathematics. The user will provide a math problem together with its proposed solution, and your task is to verify the correctness of that solution according to the given instruction."
+                )},
+                {"role": "user", "content": (
+                    "Here is a math problem and a candidate solution of it, and you need to verify the correctness of this solution. Please check each of the following:\n\n"
+                    "1. The provided content is indeed a math problem and its corresponding solution, rather than unrelated material supplied by mistake.\n"
+                    "2. The solution actually derives the conclusion required by the original problem.\n"
+                    "3. Every step of calculation and formula derivation in the solution is correct.\n"
+                    "4. The hypotheses (conditions) and conclusions of any theorems used are correctly matched and applied.\n"
+                    "5. The solution relies only on the conditions given in the problem and does not introduce any additional assumptions to obtain the conclusion.\n\n"
+                    "Consistency and error-severity policy (important):\n"
+                    "- If only minor, easily fixable issues exist (e.g., small algebraic slips later corrected, notational typos, superficial formatting), treat the solution as correct overall but briefly note such issues.\n"
+                    "- If there is any critical error that undermines correctness (e.g., invalid step, wrong theorem usage without required conditions, uncorrected calculation error leading to a wrong result), treat the solution as incorrect.\n\n"
+                    "Response requirements: If the solution is correct overall (possibly with minor issues), reply with `<verification>true</verification>` and briefly list minor issues if any."
+                    " If the solution is incorrect, reply with `<verification>false</verification>` followed by a concise description of the most harmful error."
+                    " Do not include any restatement of the entire solution or problem.\n\n"
+                    f"<problem>{p}</problem>\n\n"
+                    f"<answer>{strip_think_simple(c if isinstance(c, str) else c[0]['content'])}</answer>"
+                )}
+            ]
+            for (p, c) in zip(problems, completions)
+        ]
+        results = ASYNC_LOOP.run(self.client.infer_batch_async(all_messages, **kwargs))
+        rewards = [1.0 if extract_xml_content(r, "verification") == "true" else 0.0 for r in results]
+        return rewards, results
+
+class PessimisticVerifier():
+    """
+    Runs multiple parallel reviews using the same checklist as Verifier.
+    Instead of asking a judger, it treats the FIRST review that reports an error
+    (`<verification>false</verification>`) as the final verdict for that proof.
+    """
+    def __init__(self, api_base, api_key, model, review_times: int = 3):
+        self.client = LLMClient(api_base, api_key, model)
+        self.review_times = max(1, review_times)
+        self.last_majority_results: tuple[list[float], list[str]] = ([], [])
+        self.stepwise_review_logs: list[dict] = []
+        self.majority_step_logs: list[dict] = []
+
+    def _review_messages(self, problems, completions):
+        messages = []
+        for (p, c) in zip(problems, completions):
+            answer = strip_think_simple(c if isinstance(c, str) else c[0]['content'])
+            base = [
+                {"role": "system", "content": (
+                    "You are an assistant highly proficient in mathematics. The user will provide a math problem together with its proposed solution, and your task is to verify the correctness of that solution according to the given instruction."
+                )},
+                {"role": "user", "content": (
+                    "Here is a math problem and a candidate solution of it, and you need to verify the correctness of this solution. Please check each of the following:\n\n"
+                    "1. The provided content is indeed a math problem and its corresponding solution, rather than unrelated material supplied by mistake.\n"
+                    "2. The solution actually derives the conclusion required by the original problem.\n"
+                    "3. Every step of calculation and formula derivation in the solution is correct.\n"
+                    "4. The hypotheses (conditions) and conclusions of any theorems used are correctly matched and applied.\n"
+                    "5. The solution relies only on the conditions given in the problem and does not introduce any additional assumptions to obtain the conclusion.\n\n"
+                    "Consistency and error-severity policy (important):\n"
+                    "- If only minor, easily fixable issues exist (e.g., small algebraic slips later corrected, notational typos, superficial formatting), treat the solution as correct overall but briefly note such issues.\n"
+                    "- If there is any critical error that undermines correctness (e.g., invalid step, wrong theorem usage without required conditions, uncorrected calculation error leading to a wrong result), treat the solution as incorrect.\n\n"
+                    "Response requirements: If the solution is correct overall (possibly with minor issues), reply with `<verification>true</verification>` and briefly list minor issues if any."
+                    " If the solution is incorrect, reply with `<verification>false</verification>` followed by a concise description of the most harmful error."
+                    " Do not include any restatement of the entire solution or problem.\n\n"
+                    f"<problem>{p}</problem>\n\n"
+                    f"<answer>{answer}</answer>"
+                )}
+            ]
+            for _ in range(self.review_times):
+                messages.append(base)
+        return messages
+
+    def _majority_vote(self, reviews, verdicts):
+        positives = sum(1 for v in verdicts if v == "true")
+        negatives = sum(1 for v in verdicts if v == "false")
+
+        if positives > negatives:
+            target_verdict = "true"
+        elif negatives > positives:
+            target_verdict = "false"
+        else:
+            # Tie: randomly select one review as the final result
+            if reviews:
+                chosen = random.choice(reviews)
+                return extract_xml_content(chosen, "verification") == "true", chosen
+            return False, ""
+
+        for review, verdict in zip(reviews, verdicts):
+            if verdict == target_verdict:
+                return target_verdict == "true", review
+
+        # Fallback if no matching verdict found (should not happen)
+        return (target_verdict == "true"), (reviews[0] if reviews else "")
+
+    def _normalize_ground_truth(self, ground_truth_labels, total_samples: int) -> list[int] | None:
+        if ground_truth_labels is None:
+            return None
+        if len(ground_truth_labels) != total_samples:
+            logging.getLogger("pessimistic_verifier").warning(
+                "Ground truth label count (%d) does not match sample count (%d); skipping stepwise metrics.",
+                len(ground_truth_labels),
+                total_samples,
+            )
+            return None
+        normalized: list[int] = []
+        for idx, label in enumerate(ground_truth_labels):
+            if label is None:
+                logging.getLogger("pessimistic_verifier").warning(
+                    "Ground truth label at index %d is None; skipping stepwise metrics.",
+                    idx,
+                )
+                return None
+            normalized.append(1 if bool(label) else 0)
+        return normalized
+
+    def _record_stepwise_logs(
+        self,
+        verdicts_per_sample: list[list[str | None]],
+        ground_truth_labels: list | None,
+    ) -> None:
+        total_samples = len(verdicts_per_sample)
+        if total_samples == 0:
+            self.stepwise_review_logs = []
+            return
+
+        gt_vector = self._normalize_ground_truth(ground_truth_labels, total_samples)
+        step_count = max((len(v) for v in verdicts_per_sample), default=0)
+        cumulative_fail = [False] * total_samples
+        logs: list[dict] = []
+
+        for step_idx in range(step_count):
+            preds: list[int] = []
+            for sample_idx, verdicts in enumerate(verdicts_per_sample):
+                verdict = verdicts[step_idx] if step_idx < len(verdicts) else None
+                if verdict == "false":
+                    cumulative_fail[sample_idx] = True
+                preds.append(0 if cumulative_fail[sample_idx] else 1)
+
+            metrics = _compute_binary_metrics(preds, gt_vector) if gt_vector is not None else None
+            entry = {"step_index": step_idx + 1}
+            if metrics is not None:
+                entry["metrics"] = metrics
+            logs.append(entry)
+
+        self.stepwise_review_logs = logs
+
+    def _majority_label_from_subset(self, verdict_subset: list[str | None]) -> int | None:
+        votes = [v for v in verdict_subset if v in {"true", "false"}]
+        if not votes:
+            return None
+        positives = sum(1 for v in votes if v == "true")
+        negatives = len(votes) - positives
+        if positives > negatives:
+            return 1
+        if negatives > positives:
+            return 0
+        chosen = random.choice(votes)
+        return 1 if chosen == "true" else 0
+
+    def _record_majority_step_logs(
+        self,
+        verdicts_per_sample: list[list[str | None]],
+        ground_truth_labels: list | None,
+    ) -> None:
+        total_samples = len(verdicts_per_sample)
+        if total_samples == 0:
+            self.majority_step_logs = []
+            return
+
+        gt_vector = self._normalize_ground_truth(ground_truth_labels, total_samples)
+        step_count = max((len(v) for v in verdicts_per_sample), default=0)
+        logs: list[dict] = []
+
+        for step_idx in range(step_count):
+            preds: list[int | None] = []
+            for verdicts in verdicts_per_sample:
+                subset = verdicts[:step_idx + 1]
+                preds.append(self._majority_label_from_subset(subset))
+
+            metrics = _compute_binary_metrics(preds, gt_vector) if gt_vector is not None else None
+            entry = {"step_index": step_idx + 1}
+            if metrics is not None:
+                entry["metrics"] = metrics
+            logs.append(entry)
+
+        self.majority_step_logs = logs
+
+    def __call__(self, problems, completions, ground_truth_labels=None, **kwargs):
+        # Only perform parallel reviews and take the first error as verdict
+        review_messages = self._review_messages(problems, completions)
+        all_reviews = ASYNC_LOOP.run(self.client.infer_batch_async(review_messages, **kwargs))
+        k = self.review_times
+        grouped = [all_reviews[i * k:(i + 1) * k] for i in range(len(problems))]
+        verdicts_per_sample = [
+            [extract_xml_content(r, "verification") for r in reviews]
+            for reviews in grouped
+        ]
+
+        final_reviews = []
+        rewards = []
+        majority_reviews = []
+        majority_rewards = []
+        for reviews, verdicts in zip(grouped, verdicts_per_sample):
+
+            # find first negative review for pessimistic verdict
+            first_negative = None
+            for review, verdict in zip(reviews, verdicts):
+                if verdict == "false":
+                    first_negative = review
+                    break
+            if first_negative is not None:
+                rewards.append(0.0)
+                final_reviews.append(first_negative)
+            else:
+                rewards.append(1.0)
+                final_reviews.append(reviews[0] if reviews else "")
+
+            majority_true, majority_review = self._majority_vote(reviews, verdicts)
+            majority_rewards.append(1.0 if majority_true else 0.0)
+            majority_reviews.append(majority_review)
+
+        self.last_majority_results = (majority_rewards, majority_reviews)
+        self._record_stepwise_logs(verdicts_per_sample, ground_truth_labels)
+        self._record_majority_step_logs(verdicts_per_sample, ground_truth_labels)
+
+        return rewards, final_reviews
+
+class PessimisticPruningVerifier():
+    """
+    Runs pessimistic verification with iterative pruning.
+
+    Instead of launching all reviews in parallel, it performs 1, 2, 4, 8, ...
+    full-proof reviews across successive iterations (truncating the final round
+    so the cumulative count never exceeds `--reviews`). After each wave, any
+    proof flagged incorrect is removed from future iterations, reducing the
+    number of required calls for later rounds while retaining the same
+    first-error-wins behavior as PessimisticVerifier.
+    """
+
+    def __init__(self, api_base, api_key, model, review_times: int = 3):
+        self.client = LLMClient(api_base, api_key, model)
+        self.max_reviews = max(1, int(review_times))
+        self.iteration_plan = self._build_iteration_plan(self.max_reviews)
+        self.last_majority_results: tuple[list[float], list[str]] = ([], [])
+        self.stepwise_review_logs: list[dict] = []
+        self.majority_step_logs: list[dict] = []
+        self.last_review_counts: list[int] = []
+        self.iteration_samples_log: list[dict] = []
+        self.iteration_summary: list[dict] = []
+        self.iteration_prediction_history: list[list[int]] = []
+        self.iteration_resolved_predictions: list[list[int | None]] = []
+        self.iteration_pending_masks: list[list[bool]] = []
+        self.iteration_review_costs: list[dict] = []
+
+    @staticmethod
+    def _build_iteration_plan(max_reviews: int) -> list[int]:
+        plan: list[int] = []
+        used = 0
+        chunk = 1
+        while used < max_reviews:
+            remaining = max_reviews - used
+            this_chunk = chunk if chunk <= remaining else remaining
+            plan.append(this_chunk)
+            used += this_chunk
+            if this_chunk < chunk:
+                break
+            chunk *= 2
+        return plan
+
+    def _build_base_message(self, problem: str, completion) -> list[dict]:
+        answer = strip_think_simple(completion if isinstance(completion, str) else completion[0]['content'])
+        return [
+            {"role": "system", "content": (
+                "You are an assistant highly proficient in mathematics. The user will provide a math problem together with its proposed solution, and your task is to verify the correctness of that solution according to the given instruction."
+            )},
+            {"role": "user", "content": (
+                "Here is a math problem and a candidate solution of it, and you need to verify the correctness of this solution. Please check each of the following:\n\n"
+                "1. The provided content is indeed a math problem and its corresponding solution, rather than unrelated material supplied by mistake.\n"
+                "2. The solution actually derives the conclusion required by the original problem.\n"
+                "3. Every step of calculation and formula derivation in the solution is correct.\n"
+                "4. The hypotheses (conditions) and conclusions of any theorems used are correctly matched and applied.\n"
+                "5. The solution relies only on the conditions given in the problem and does not introduce any additional assumptions to obtain the conclusion.\n\n"
+                "Consistency and error-severity policy (important):\n"
+                "- If only minor, easily fixable issues exist (e.g., small algebraic slips later corrected, notational typos, superficial formatting), treat the solution as correct overall but briefly note such issues.\n"
+                "- If there is any critical error that undermines correctness (e.g., invalid step, wrong theorem usage without required conditions, uncorrected calculation error leading to a wrong result), treat the solution as incorrect.\n\n"
+                "Response requirements: If the solution is correct overall (possibly with minor issues), reply with `<verification>true</verification>` and briefly list minor issues if any."
+                " If the solution is incorrect, reply with `<verification>false</verification>` followed by a concise description of the most harmful error."
+                " Do not include any restatement of the entire solution or problem.\n\n"
+                f"<problem>{problem}</problem>\n\n"
+                f"<answer>{answer}</answer>"
+            )}
+        ]
+
+    def _majority_vote(self, reviews, verdicts):
+        positives = sum(1 for v in verdicts if v == "true")
+        negatives = sum(1 for v in verdicts if v == "false")
+
+        if positives > negatives:
+            target_verdict = "true"
+        elif negatives > positives:
+            target_verdict = "false"
+        else:
+            if reviews:
+                chosen = random.choice(reviews)
+                return extract_xml_content(chosen, "verification") == "true", chosen
+            return False, ""
+
+        for review, verdict in zip(reviews, verdicts):
+            if verdict == target_verdict:
+                return target_verdict == "true", review
+
+        return (target_verdict == "true"), (reviews[0] if reviews else "")
+
+    def _normalize_ground_truth(self, ground_truth_labels, total_samples: int) -> list[int] | None:
+        if ground_truth_labels is None:
+            return None
+        if len(ground_truth_labels) != total_samples:
+            logging.getLogger("pessimistic_pruning_verifier").warning(
+                "Ground truth label count (%d) does not match sample count (%d); skipping stepwise metrics.",
+                len(ground_truth_labels),
+                total_samples,
+            )
+            return None
+        normalized: list[int] = []
+        for idx, label in enumerate(ground_truth_labels):
+            if label is None:
+                logging.getLogger("pessimistic_pruning_verifier").warning(
+                    "Ground truth label at index %d is None; skipping stepwise metrics.",
+                    idx,
+                )
+                return None
+            normalized.append(1 if bool(label) else 0)
+        return normalized
+
+    def _record_stepwise_logs(
+        self,
+        verdicts_per_sample: list[list[str | None]],
+        ground_truth_labels: list | None,
+    ) -> None:
+        total_samples = len(verdicts_per_sample)
+        if total_samples == 0:
+            self.stepwise_review_logs = []
+            return
+
+        gt_vector = self._normalize_ground_truth(ground_truth_labels, total_samples)
+        step_count = max((len(v) for v in verdicts_per_sample), default=0)
+        cumulative_fail = [False] * total_samples
+        logs: list[dict] = []
+
+        for step_idx in range(step_count):
+            preds: list[int] = []
+            for sample_idx, verdicts in enumerate(verdicts_per_sample):
+                verdict = verdicts[step_idx] if step_idx < len(verdicts) else None
+                if verdict == "false":
+                    cumulative_fail[sample_idx] = True
+                preds.append(0 if cumulative_fail[sample_idx] else 1)
+
+            metrics = _compute_binary_metrics(preds, gt_vector) if gt_vector is not None else None
+            entry = {"step_index": step_idx + 1}
+            if metrics is not None:
+                entry["metrics"] = metrics
+            logs.append(entry)
+
+        self.stepwise_review_logs = logs
+
+    def _majority_label_from_subset(self, verdict_subset: list[str | None]) -> int | None:
+        votes = [v for v in verdict_subset if v in {"true", "false"}]
+        if not votes:
+            return None
+        positives = sum(1 for v in votes if v == "true")
+        negatives = len(votes) - positives
+        if positives > negatives:
+            return 1
+        if negatives > positives:
+            return 0
+        chosen = random.choice(votes)
+        return 1 if chosen == "true" else 0
+
+    def _record_majority_step_logs(
+        self,
+        verdicts_per_sample: list[list[str | None]],
+        ground_truth_labels: list | None,
+    ) -> None:
+        total_samples = len(verdicts_per_sample)
+        if total_samples == 0:
+            self.majority_step_logs = []
+            return
+
+        gt_vector = self._normalize_ground_truth(ground_truth_labels, total_samples)
+        step_count = max((len(v) for v in verdicts_per_sample), default=0)
+        logs: list[dict] = []
+
+        for step_idx in range(step_count):
+            preds: list[int | None] = []
+            for verdicts in verdicts_per_sample:
+                subset = verdicts[:step_idx + 1]
+                preds.append(self._majority_label_from_subset(subset))
+
+            metrics = _compute_binary_metrics(preds, gt_vector) if gt_vector is not None else None
+            entry = {"step_index": step_idx + 1}
+            if metrics is not None:
+                entry["metrics"] = metrics
+            logs.append(entry)
+
+        self.majority_step_logs = logs
+
+    def __call__(self, problems, completions, ground_truth_labels=None, **kwargs):
+        total = len(problems)
+        if total == 0:
+            self.last_majority_results = ([], [])
+            self.stepwise_review_logs = []
+            self.majority_step_logs = []
+            self.last_review_counts = []
+            self.iteration_samples_log = []
+            self.iteration_summary = []
+            self.iteration_prediction_history = []
+            self.iteration_resolved_predictions = []
+            self.iteration_pending_masks = []
+            self.iteration_review_costs = []
+            return [], []
+
+        base_messages = [self._build_base_message(problem, completion) for problem, completion in zip(problems, completions)]
+        rewards: list[float | None] = [None] * total
+        final_reviews: list[str] = [""] * total
+        pending_indices = list(range(total))
+        total_review_counts = [0] * total
+        reviews_history: list[list[str]] = [[] for _ in range(total)]
+        verdicts_history: list[list[str | None]] = [[] for _ in range(total)]
+        sample_states = [
+            {
+                "status": "pending",
+                "resolved_iteration": None,
+                "final_text": "",
+            }
+            for _ in range(total)
+        ]
+        self.iteration_samples_log = []
+        self.iteration_summary = []
+        self.iteration_prediction_history = []
+        self.iteration_resolved_predictions = []
+        self.iteration_pending_masks = []
+        self.iteration_review_costs = []
+        cumulative_reviews = 0
+
+        for iteration, reviews_per_sample in enumerate(self.iteration_plan):
+            if not pending_indices:
+                break
+
+            batch_messages = []
+            iteration_batch_info: list[dict] = []
+            for idx in pending_indices:
+                for _ in range(reviews_per_sample):
+                    batch_messages.append(base_messages[idx])
+                iteration_batch_info.append({
+                    "sample_index": idx,
+                    "num_reviews": reviews_per_sample,
+                })
+                total_review_counts[idx] += reviews_per_sample
+
+            if not batch_messages:
+                break
+
+            iteration_reviews_raw = ASYNC_LOOP.run(self.client.infer_batch_async(batch_messages, **kwargs))
+            latest_input_tokens = getattr(self.client, "last_input_tokens", []) or []
+            latest_comp_tokens = getattr(self.client, "last_comp_tokens", []) or []
+            avg_input_tokens_this_iter = (
+                sum(latest_input_tokens) / len(latest_input_tokens)
+                if latest_input_tokens else None
+            )
+            avg_comp_tokens_this_iter = (
+                sum(latest_comp_tokens) / len(latest_comp_tokens)
+                if latest_comp_tokens else None
+            )
+            cumulative_input_tokens = getattr(self.client, "input_tokens", []) or []
+            cumulative_comp_tokens = getattr(self.client, "comp_tokens", []) or []
+            avg_input_tokens_cumulative = (
+                sum(cumulative_input_tokens) / len(cumulative_input_tokens)
+                if cumulative_input_tokens else None
+            )
+            avg_comp_tokens_cumulative = (
+                sum(cumulative_comp_tokens) / len(cumulative_comp_tokens)
+                if cumulative_comp_tokens else None
+            )
+
+            cursor = 0
+            next_pending = []
+            iteration_samples = []
+            failed_this_iter = 0
+            passed_this_iter = 0
+            reviews_this_iter = 0
+
+            for info in iteration_batch_info:
+                sample_idx = info["sample_index"]
+                count = info["num_reviews"]
+                sample_reviews = iteration_reviews_raw[cursor:cursor + count]
+                cursor += count
+                reviews_this_iter += count
+                verdicts = [extract_xml_content(r, "verification") for r in sample_reviews]
+                reviews_history[sample_idx].extend(sample_reviews)
+                verdicts_history[sample_idx].extend(verdicts)
+
+                first_negative = None
+                for review, verdict in zip(sample_reviews, verdicts):
+                    if verdict == "false":
+                        first_negative = review
+                        break
+
+                if first_negative is not None:
+                    rewards[sample_idx] = 0.0
+                    final_reviews[sample_idx] = first_negative
+                    sample_states[sample_idx].update({
+                        "status": "failed",
+                        "resolved_iteration": iteration + 1,
+                        "final_text": first_negative,
+                    })
+                    status_label = "failed"
+                    status_eval = 0.0
+                    failed_this_iter += 1
+                else:
+                    if iteration == len(self.iteration_plan) - 1:
+                        rewards[sample_idx] = 1.0
+                        final_reviews[sample_idx] = reviews_history[sample_idx][0] if reviews_history[sample_idx] else ""
+                        sample_states[sample_idx].update({
+                            "status": "passed",
+                            "resolved_iteration": iteration + 1,
+                            "final_text": final_reviews[sample_idx],
+                        })
+                        status_label = "passed"
+                        status_eval = 1.0
+                        passed_this_iter += 1
+                    else:
+                        next_pending.append(sample_idx)
+                        status_label = "pending"
+                        status_eval = None
+
+                iteration_samples.append({
+                    "sample_index": sample_idx,
+                    "status": status_label,
+                    "eval": status_eval,
+                    "verification": final_reviews[sample_idx] if status_eval is not None else None,
+                    "num_reviews": count,
+                    "reviews": sample_reviews,
+                    "verdicts": verdicts,
+                })
+
+            pending_indices = next_pending
+
+            statuses = [state["status"] for state in sample_states]
+            preds_if_stop = [0 if status == "failed" else 1 for status in statuses]
+            resolved_preds = [
+                0 if status == "failed" else 1 if status == "passed" else None
+                for status in statuses
+            ]
+            pending_mask = [status == "pending" for status in statuses]
+            cumulative_reviews += reviews_this_iter
+
+            self.iteration_samples_log.append({
+                "iteration_index": iteration + 1,
+                "samples": iteration_samples,
+            })
+            self.iteration_summary.append({
+                "iteration_index": iteration + 1,
+                "reviews_per_sample": reviews_per_sample,
+                "reviewed_samples": len(iteration_batch_info),
+                "failed_this_iter": failed_this_iter,
+                "passed_this_iter": passed_this_iter,
+                "pending_after_iteration": len(next_pending),
+            })
+            self.iteration_prediction_history.append(preds_if_stop)
+            self.iteration_resolved_predictions.append(resolved_preds)
+            self.iteration_pending_masks.append(pending_mask)
+            self.iteration_review_costs.append({
+                "iteration_index": iteration + 1,
+                "reviews_this_iter": reviews_this_iter,
+                "cumulative_reviews": cumulative_reviews,
+                "avg_input_tokens_this_iter": avg_input_tokens_this_iter,
+                "avg_output_tokens_this_iter": avg_comp_tokens_this_iter,
+                "avg_input_tokens_cumulative": avg_input_tokens_cumulative,
+                "avg_output_tokens_cumulative": avg_comp_tokens_cumulative,
+            })
+
+        for idx in pending_indices:
+            if rewards[idx] is None:
+                rewards[idx] = 1.0
+                final_reviews[idx] = reviews_history[idx][0] if reviews_history[idx] else ""
+                sample_states[idx].update({
+                    "status": "passed",
+                    "resolved_iteration": len(self.iteration_plan),
+                    "final_text": final_reviews[idx],
+                })
+
+        for i, reward in enumerate(rewards):
+            if reward is None:
+                rewards[i] = 1.0
+            if not final_reviews[i] and reviews_history[i]:
+                final_reviews[i] = reviews_history[i][0]
+
+        majority_rewards = []
+        majority_reviews = []
+        for reviews, verdicts in zip(reviews_history, verdicts_history):
+            majority_true, majority_review = self._majority_vote(reviews, verdicts)
+            majority_rewards.append(1.0 if majority_true else 0.0)
+            majority_reviews.append(majority_review)
+
+        self.last_majority_results = (majority_rewards, majority_reviews)
+        self._record_stepwise_logs(verdicts_history, ground_truth_labels)
+        self._record_majority_step_logs(verdicts_history, ground_truth_labels)
+        self.last_review_counts = total_review_counts
+
+        return rewards, final_reviews
+
+class VPessimisticVerifier():
+    """
+    Chunked pessimistic verifier.
+
+    Instead of reviewing the whole proof at once, it splits the proof into
+    chunks of `chunk_length` lines. For each chunk, it asks the reviewer to
+    focus only on that chunk while still providing the full problem and full
+    proof for context. If any chunk is flagged incorrect (`<verification>false</verification>`),
+    the final verdict is false. It also aggregates all error reports found.
+    """
+    def __init__(self, api_base, api_key, model, chunk_length: int = 7):
+        self.client = LLMClient(api_base, api_key, model)
+        self.chunk_length = max(1, int(chunk_length))
+        
+        # Constant fallback text when no critical errors are found across all chunks
+        self.NO_ERROR_FALLBACK: str = (
+            "<verification>true</verification>\n"
+            "No critical error found in this proof after chunked review. "
+            "All inspected chunks were considered correct overall given the problem and prior steps. "
+            "Minor, non-decisive issues (e.g., superficial notation or small slips later corrected) "
+            "may exist but do not undermine correctness."
+        )
+
+    def _split_into_chunks(self, proof: str) -> list[str]:
+        lines = (proof or "").splitlines()
+        chunks = []
+        for i in range(0, len(lines), self.chunk_length):
+            chunk_lines = lines[i:i + self.chunk_length]
+            chunks.append("\n".join(chunk_lines))
+        if not chunks:
+            chunks = [proof or ""]
+        return chunks
+
+    def _build_messages_for_one(self, problem: str, full_proof: str) -> list[list[dict]]:
+        """Build messages for all chunks of a single (problem, proof)."""
+        chunks = self._split_into_chunks(full_proof)
+        messages_per_chunk = []
+        for idx, chunk in enumerate(chunks, start=1):
+            messages_per_chunk.append([
+                {"role": "system", "content": (
+                    "You are an assistant highly proficient in mathematics. The user will provide a math problem together with its proposed solution, and your task is to verify the correctness of that solution according to the given instruction."
+                )},
+                {"role": "user", "content": (
+                    "We provide the original problem and the complete proposed solution for full context. "
+                    "Then we provide a specific chunk from the solution for focused checking. "
+                    "Your task: Check ONLY the given chunk for errors while considering the overall context.\n\n"
+                    "Checklist:\n"
+                    "1. The chunk’s reasoning and calculations adhere to mathematical correctness.\n"
+                    "2. Any theorems used in the chunk match their hypotheses and conclusions.\n"
+                    "3. The chunk does not rely on assumptions not justified by the problem or earlier proven steps.\n\n"
+                    "Consistency and error-severity policy (important):\n"
+                    "- If only minor, easily fixable issues exist (e.g., small algebraic slips later corrected, notational typos, superficial formatting), treat the chunk as correct overall but briefly note such issues.\n"
+                    "- If there is any critical error that undermines correctness in this chunk (e.g., invalid step, wrong theorem usage without required conditions), treat the chunk as incorrect.\n\n"
+                    "Response requirements: If the chunk is correct overall (possibly with minor issues), reply with `<verification>true</verification>` and briefly list minor issues if any. "
+                    "If the chunk is incorrect, reply with `<verification>false</verification>` followed by a concise description of the most harmful error in the chunk.\n\n"
+                    f"<problem>{problem}</problem>\n\n"
+                    f"<full_answer>{strip_think_simple(full_proof)}</full_answer>\n\n"
+                    f"<chunk_index>{idx}</chunk_index>\n"
+                    f"<chunk>{chunk}</chunk>"
+                )}
+            ])
+        return messages_per_chunk
+
+    def __call__(self, problems, completions, **kwargs):
+        """
+        For each proof, review all chunks. Any chunk error makes the final verdict false.
+        Returns evals (1.0 or 0.0 per proof) and aggregated review texts per proof.
+        """
+        # Build all chunk messages across the batch
+        batch_messages = []
+        per_item_chunk_counts = []
+        for p, c in zip(problems, completions):
+            full_answer = c if isinstance(c, str) else c[0]['content']
+            full_answer = strip_think_simple(full_answer)
+            msgs = self._build_messages_for_one(p, full_answer)
+            per_item_chunk_counts.append(len(msgs))
+            batch_messages.extend(msgs)
+
+        # Expose counts for logging/analysis
+        self.last_chunk_counts = per_item_chunk_counts[:]
+
+        # Run inference over all chunks
+        all_chunk_reviews = ASYNC_LOOP.run(self.client.infer_batch_async(batch_messages, **kwargs))
+
+        # Group reviews by original sample
+        grouped_reviews = []
+        cursor = 0
+        for count in per_item_chunk_counts:
+            grouped_reviews.append(all_chunk_reviews[cursor:cursor + count])
+            cursor += count
+
+        # Aggregate verdicts and collect all errors
+        evals = []
+        final_texts = []
+        for reviews in grouped_reviews:
+            has_error = False
+            errors_text = []
+            fallback_text = reviews[0] if reviews else ""
+            for r in reviews:
+                verdict = extract_xml_content(r, "verification")
+                if verdict == "false":
+                    has_error = True
+                    errors_text.append(strip_think_simple(r))
+            if has_error:
+                evals.append(0.0)
+                # Aggregate all error reports into one text block
+                combined = "\n\n".join(errors_text) if errors_text else fallback_text
+                final_texts.append(combined)
+            else:
+                evals.append(1.0)
+                # If no errors, return a constant message instead of first review
+                final_texts.append(self.NO_ERROR_FALLBACK)
+
+        return evals, final_texts
+
+class ProgressivePessimisticVerifier():
+    """
+    Iteratively applies chunked pessimistic verification with progressively
+    finer granularity. It now begins with the same whole-proof prompt used by
+    the standard verifier to avoid repeating the solution twice, and then
+    doubles the number of chunks (down to min_chunk_size per chunk) for
+    still-positive samples until either an error is found or max_iters is
+    reached.
+    """
+    def __init__(self, api_base, api_key, model, max_iters: int = 3, min_chunk_size: int = 6):
+        self.client = LLMClient(api_base, api_key, model)
+        self.max_iters = max(1, int(max_iters))
+        self.min_chunk_size = max(1, int(min_chunk_size))
+        self.last_review_counts: list[int] = []
+        self.iteration_samples_log: list[dict] = []
+        self.iteration_summary: list[dict] = []
+        self.iteration_prediction_history: list[list[int]] = []
+        self.iteration_resolved_predictions: list[list[int | None]] = []
+        self.iteration_pending_masks: list[list[bool]] = []
+        self.iteration_review_costs: list[dict] = []
+
+        self.NO_ERROR_FALLBACK: str = (
+            "<verification>true</verification>\n"
+            "No critical error found in this proof after progressive chunked review. "
+            "All passes (from coarse to fine) considered the solution correct overall. "
+            "Minor, non-decisive issues may exist but do not undermine correctness."
+        )
+
+    def _split_into_chunks(self, proof: str, chunk_length: int) -> list[str]:
+        lines = (proof or "").splitlines()
+        if not lines:
+            return [proof or ""]
+        chunks = []
+        for i in range(0, len(lines), chunk_length):
+            chunk_lines = lines[i:i + chunk_length]
+            chunks.append("\n".join(chunk_lines))
+        return chunks
+
+    def _build_standard_messages_for_one(self, problem: str, full_proof: str) -> list[list[dict]]:
+        stripped_proof = strip_think_simple(full_proof)
+        return [[
+            {"role": "system", "content": (
+                "You are an assistant highly proficient in mathematics. The user will provide a math problem together with its proposed solution, and your task is to verify the correctness of that solution according to the given instruction."
+            )},
+            {"role": "user", "content": (
+                "Here is a math problem and a candidate solution of it, and you need to verify the correctness of this solution. Please check each of the following:\n\n"
+                "1. The provided content is indeed a math problem and its corresponding solution, rather than unrelated material supplied by mistake.\n"
+                "2. The solution actually derives the conclusion required by the original problem.\n"
+                "3. Every step of calculation and formula derivation in the solution is correct.\n"
+                "4. The hypotheses (conditions) and conclusions of any theorems used are correctly matched and applied.\n"
+                "5. The solution relies only on the conditions given in the problem and does not introduce any additional assumptions to obtain the conclusion.\n\n"
+                "Consistency and error-severity policy (important):\n"
+                "- If only minor, easily fixable issues exist (e.g., small algebraic slips later corrected, notational typos, superficial formatting), treat the solution as correct overall but briefly note such issues.\n"
+                "- If there is any critical error that undermines correctness (e.g., invalid step, wrong theorem usage without required conditions, uncorrected calculation error leading to a wrong result), treat the solution as incorrect.\n\n"
+                "Response requirements: If the solution is correct overall (possibly with minor issues), reply with `<verification>true</verification>` and briefly list minor issues if any."
+                " If the solution is incorrect, reply with `<verification>false</verification>` followed by a concise description of the most harmful error."
+                " Do not include any restatement of the entire solution or problem.\n\n"
+                f"<problem>{problem}</problem>\n\n"
+                f"<answer>{stripped_proof}</answer>"
+            )}
+        ]]
+
+    def _build_messages_for_one(self, problem: str, full_proof: str, chunk_length: int) -> list[list[dict]]:
+        chunks = self._split_into_chunks(full_proof, chunk_length)
+        messages_per_chunk = []
+        for idx, chunk in enumerate(chunks, start=1):
+            messages_per_chunk.append([
+                {"role": "system", "content": (
+                    "You are an assistant highly proficient in mathematics. The user will provide a math problem together with its proposed solution, and your task is to verify the correctness of that solution according to the given instruction."
+                )},
+                {"role": "user", "content": (
+                    "We provide the original problem and the complete proposed solution for full context. "
+                    "Then we provide a specific chunk from the solution for focused checking. "
+                    "Your task: Check ONLY the given chunk for errors while considering the overall context.\n\n"
+                    "Checklist:\n"
+                    "1. The chunk's reasoning and calculations adhere to mathematical correctness.\n"
+                    "2. Any theorems used in the chunk match their hypotheses and conclusions.\n"
+                    "3. The chunk does not rely on assumptions not justified by the problem or earlier proven steps.\n\n"
+                    "Consistency and error-severity policy (important):\n"
+                    "- If only minor, easily fixable issues exist (e.g., small algebraic slips later corrected, notational typos, superficial formatting), treat the chunk as correct overall but briefly note such issues.\n"
+                    "- If there is any critical error that undermines correctness in this chunk (e.g., invalid step, wrong theorem usage without required conditions), treat the chunk as incorrect.\n\n"
+                    "Response requirements: If the chunk is correct overall (possibly with minor issues), reply with `<verification>true</verification>` and briefly list minor issues if any. "
+                    "If the chunk is incorrect, reply with `<verification>false</verification>` followed by a concise description of the most harmful error in the proof that you found in the chunk.\n\n"
+                    f"<problem>{problem}</problem>\n\n"
+                    f"<full_answer>{full_proof}</full_answer>\n\n"
+                    f"<chunk_index>{idx}</chunk_index>\n"
+                    f"<chunk>{chunk}</chunk>"
+                )}
+            ])
+        return messages_per_chunk
+
+    def _chunk_length_for_iteration(self, proof: str, iteration: int) -> int:
+        lines = (proof or "").splitlines()
+        num_lines = len(lines)
+        if num_lines == 0:
+            return self.min_chunk_size
+        if iteration == 0:
+            return max(num_lines, self.min_chunk_size)
+        target_chunks = max(1, 2 ** iteration)
+        approx_length = (num_lines + target_chunks - 1) // target_chunks
+        return max(self.min_chunk_size, approx_length)
+
+    def __call__(self, problems, completions, **kwargs):
+        total = len(problems)
+        if total == 0:
+            self.last_review_counts = []
+            self.iteration_samples_log = []
+            self.iteration_summary = []
+            self.iteration_prediction_history = []
+            self.iteration_resolved_predictions = []
+            self.iteration_pending_masks = []
+            self.iteration_review_costs = []
+            return [], []
+
+        proofs = [strip_think_simple(c if isinstance(c, str) else c[0]['content']) for c in completions]
+        evals: list[float | None] = [None] * total
+        final_texts = [""] * total
+        pending_indices = list(range(total))
+        total_review_counts = [0] * total
+        self.iteration_samples_log = []
+        self.iteration_summary = []
+        self.iteration_prediction_history = []
+        self.iteration_resolved_predictions = []
+        self.iteration_pending_masks = []
+        self.iteration_review_costs = []
+        sample_states = [
+            {
+                "status": "pending",
+                "resolved_iteration": None,
+                "final_text": ""
+            }
+            for _ in range(total)
+        ]
+        cumulative_reviews = 0
+
+        for iteration in range(self.max_iters):
+            if not pending_indices:
+                break
+
+            batch_messages = []
+            iteration_batch_info: list[dict] = []
+            for idx in pending_indices:
+                problem = problems[idx]
+                proof = proofs[idx]
+                chunk_length = self._chunk_length_for_iteration(proof, iteration)
+                if iteration == 0:
+                    msgs = self._build_standard_messages_for_one(problem, proof)
+                    iteration_mode = "standard"
+                else:
+                    msgs = self._build_messages_for_one(problem, proof, chunk_length)
+                    iteration_mode = "chunk"
+                iteration_batch_info.append({
+                    "sample_index": idx,
+                    "chunk_length": chunk_length,
+                    "num_chunks": len(msgs),
+                    "mode": iteration_mode,
+                })
+                total_review_counts[idx] += len(msgs)
+                batch_messages.extend(msgs)
+
+            if not batch_messages:
+                break
+
+            chunk_reviews = ASYNC_LOOP.run(self.client.infer_batch_async(batch_messages, **kwargs))
+            # Token usage stats for this iteration and cumulatively so far
+            latest_input_tokens = getattr(self.client, "last_input_tokens", []) or []
+            latest_comp_tokens = getattr(self.client, "last_comp_tokens", []) or []
+            avg_input_tokens_this_iter = (
+                sum(latest_input_tokens) / len(latest_input_tokens)
+                if latest_input_tokens else None
+            )
+            avg_comp_tokens_this_iter = (
+                sum(latest_comp_tokens) / len(latest_comp_tokens)
+                if latest_comp_tokens else None
+            )
+            cumulative_input_tokens = getattr(self.client, "input_tokens", []) or []
+            cumulative_comp_tokens = getattr(self.client, "comp_tokens", []) or []
+            avg_input_tokens_cumulative = (
+                sum(cumulative_input_tokens) / len(cumulative_input_tokens)
+                if cumulative_input_tokens else None
+            )
+            avg_comp_tokens_cumulative = (
+                sum(cumulative_comp_tokens) / len(cumulative_comp_tokens)
+                if cumulative_comp_tokens else None
+            )
+
+            cursor = 0
+            next_pending = []
+            iteration_samples = []
+            failed_this_iter = 0
+            passed_this_iter = 0
+            chunk_lengths_this_iter = []
+            reviews_this_iter = 0
+
+            for info in iteration_batch_info:
+                sample_idx = info["sample_index"]
+                count = info["num_chunks"]
+                sample_reviews = chunk_reviews[cursor:cursor + count]
+                cursor += count
+                reviews_this_iter += count
+                chunk_lengths_this_iter.append(info["chunk_length"])
+
+                chunk_errors: list[str] = []
+                use_chunk_labels = info.get("mode") == "chunk"
+                for chunk_id, review in enumerate(sample_reviews, start=1):
+                    verdict = extract_xml_content(review, "verification")
+                    if verdict == "false":
+                        formatted = strip_think_simple(review)
+                        if use_chunk_labels:
+                            formatted = f"[chunk {chunk_id}] {formatted}"
+                        chunk_errors.append(formatted)
+
+                if chunk_errors:
+                    evals[sample_idx] = 0.0
+                    combined_errors = "\n\n".join(chunk_errors)
+                    final_texts[sample_idx] = combined_errors
+                    sample_states[sample_idx].update({
+                        "status": "failed",
+                        "resolved_iteration": iteration + 1,
+                        "final_text": combined_errors,
+                    })
+                    status_label = "failed"
+                    status_eval = 0.0
+                    failed_this_iter += 1
+                else:
+                    if iteration == self.max_iters - 1:
+                        evals[sample_idx] = 1.0
+                        final_texts[sample_idx] = self.NO_ERROR_FALLBACK
+                        sample_states[sample_idx].update({
+                            "status": "passed",
+                            "resolved_iteration": iteration + 1,
+                            "final_text": self.NO_ERROR_FALLBACK,
+                        })
+                        status_label = "passed"
+                        status_eval = 1.0
+                        passed_this_iter += 1
+                    else:
+                        next_pending.append(sample_idx)
+                        status_label = "pending"
+                        status_eval = None
+
+                iteration_samples.append({
+                    "sample_index": sample_idx,
+                    "status": status_label,
+                    "eval": status_eval,
+                    "verification": final_texts[sample_idx] if status_eval is not None else None,
+                    "chunk_length": info["chunk_length"],
+                    "num_chunks": info["num_chunks"],
+                    "chunk_reviews": sample_reviews,
+                    "chunk_errors": chunk_errors,
+                    "mode": info.get("mode"),
+                })
+
+            pending_indices = next_pending
+
+            chunk_length_stats = {}
+            if chunk_lengths_this_iter:
+                chunk_length_stats = {
+                    "min": min(chunk_lengths_this_iter),
+                    "max": max(chunk_lengths_this_iter),
+                    "mean": sum(chunk_lengths_this_iter) / len(chunk_lengths_this_iter),
+                }
+            cumulative_reviews += reviews_this_iter
+
+            statuses = [state["status"] for state in sample_states]
+            preds_if_stop = [0 if status == "failed" else 1 for status in statuses]
+            resolved_preds = [
+                0 if status == "failed" else 1 if status == "passed" else None
+                for status in statuses
+            ]
+            pending_mask = [status == "pending" for status in statuses]
+
+            self.iteration_samples_log.append({
+                "iteration_index": iteration + 1,
+                "samples": iteration_samples,
+            })
+            self.iteration_summary.append({
+                "iteration_index": iteration + 1,
+                "reviewed_samples": len(iteration_batch_info),
+                "failed_this_iter": failed_this_iter,
+                "passed_this_iter": passed_this_iter,
+                "pending_after_iteration": len(next_pending),
+                "chunk_length_stats": chunk_length_stats,
+            })
+            self.iteration_prediction_history.append(preds_if_stop)
+            self.iteration_resolved_predictions.append(resolved_preds)
+            self.iteration_pending_masks.append(pending_mask)
+            self.iteration_review_costs.append({
+                "iteration_index": iteration + 1,
+                "reviews_this_iter": reviews_this_iter,
+                "cumulative_reviews": cumulative_reviews,
+                "avg_input_tokens_this_iter": avg_input_tokens_this_iter,
+                "avg_output_tokens_this_iter": avg_comp_tokens_this_iter,
+                "avg_input_tokens_cumulative": avg_input_tokens_cumulative,
+                "avg_output_tokens_cumulative": avg_comp_tokens_cumulative,
+            })
+
+        # Any remaining samples (e.g., no further iterations but never failed) are treated as passes.
+        for idx in pending_indices:
+            if evals[idx] is None:
+                evals[idx] = 1.0
+                final_texts[idx] = self.NO_ERROR_FALLBACK
+                sample_states[idx].update({
+                    "status": "passed",
+                    "resolved_iteration": self.max_iters,
+                    "final_text": self.NO_ERROR_FALLBACK,
+                })
+
+        # For any sample that never received a review (e.g., empty proof), ensure defaults.
+        for i, value in enumerate(evals):
+            if value is None:
+                evals[i] = 1.0
+                final_texts[i] = self.NO_ERROR_FALLBACK
+                sample_states[i].update({
+                    "status": "passed",
+                    "resolved_iteration": self.max_iters,
+                    "final_text": self.NO_ERROR_FALLBACK,
+                })
+
+        self.last_review_counts = total_review_counts
+        return evals, final_texts
+
+class NaiveProver():
+    """
+    NaiveProver directly proves the given problem
+    """
+    def __init__(self, api_base, api_key, model):
+        self.client = LLMClient(api_base, api_key, model)
+
+    def __call__(self, problems: list[str], **kwargs):
+        all_messages = [
+            [
+                {"role": "user", "content": f"Please provide a complete and rigorous solution to this problem:\n\n{p}"}
+            ]
+            for p in problems
+        ]
+        results = ASYNC_LOOP.run(self.client.infer_batch_async(all_messages, **kwargs))
+        return results
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="RProver"
+    )
+    parser.add_argument("-ed", "--eval_dataset", help="the path to the dataset used for evaluation", default="")
+    parser.add_argument("-pm", "--proof_model", help="model that generates proofs for given problems", default="")
+    parser.add_argument("-em", "--eval_model", help="the model used for evaluation (if needed)", default="")
+    parser.add_argument("--log_dir", help="the logging directory path", default="eval_logs")
+    parser.add_argument("--reasoning_effort", help="the reasoning_effort parameter for some models", default="medium", choices=["minimal", "low", "medium", "high"])
+    parser.add_argument("--reviewer", default="standard", choices=["standard", "pessimistic", "vpessimistic", "progressive", "ppruning"], help="the reviewer used for evaluation")
+    parser.add_argument("--reviews", type=int, default=3, help="maximum reviews per sample for multi-review verifiers (pessimistic/ppruning)")
+    parser.add_argument("--chunk_length", type=int, default=7, help="lines per chunk for vpessimistic reviewer")
+    parser.add_argument("--progressive_max_iters", type=int, default=3, help="maximum refinement passes for progressive reviewer")
+    parser.add_argument("--progressive_min_chunk_size", type=int, default=6, help="minimum lines per chunk for progressive reviewer")
+    parser.add_argument("--prover_base_url", default="", help="the base url for prover")
+    parser.add_argument("--eval_base_url", default="", help="the base url for evaluator")
+    parser.add_argument("--prover_api_key", default="", help="the api key for the prover")
+    parser.add_argument("--eval_api_key", default="", help="the api key for the evaluator")
+    parser.add_argument("--enable_thinking", action=argparse.BooleanOptionalAction, default=True, help="toggle enable_thinking parameter for models that support reasoning traces")
+    parser.add_argument(
+        "--verifier_samples",
+        default="",
+        help=(
+            "path to a previously generated verifier_samples.json. "
+            "When set, uses the same problems, proofs, and golden labels from the file, "
+            "skipping new proof generation and ground-truth verification."
+        ),
+    )
+
+    logger = logging.getLogger("main")
+    args = parser.parse_args()
+    logger.info("start verifying with proof_model: %s", args.proof_model)
+    logger.info("using eval model: %s", args.eval_model)
+
+    # If verifier_samples is provided, use it to load problems/proofs and GT labels
+    loaded_verifier_samples = None
+    preloaded_gt_labels = None
+    preloaded_gt_texts = None
+    if args.verifier_samples:
+        if args.verifier_samples == "Salesforce/Hard2Verify" or args.verifier_samples == "NP_dataset/gradingbench.csv":
+            ds = prepare_dataset(args.verifier_samples)
+            problems = ds["problem"]
+            proofs = ds["proof"]
+            # preloaded_gt_texts = [e["human_labels_first_error_idx"] for e in ds]
+            preloaded_gt_labels = ds["gt_eval"]
+            preloaded_gt_texts = [None] * len(problems)
+            logger.info("Loaded %d samples from verifier_samples: %s", len(problems), args.verifier_samples)
+        else:
+            vs_path = Path(args.verifier_samples) / "samples.json"
+            with vs_path.open("r", encoding="utf-8") as f:
+                loaded_verifier_samples = json.load(f)
+            if not isinstance(loaded_verifier_samples, list):
+                raise ValueError("verifier_samples must be a list of sample dicts")
+            problems = [s.get("problem", "") for s in loaded_verifier_samples]
+            proofs = [s.get("proof", "") for s in loaded_verifier_samples]
+            preloaded_gt_labels = [bool(s.get("eval", False)) for s in loaded_verifier_samples]
+            preloaded_gt_texts = [s.get("verification", "") for s in loaded_verifier_samples]
+            logger.info("Loaded %d samples from verifier_samples: %s", len(problems), vs_path)
+    else:
+        ds = prepare_dataset(args.eval_dataset)
+        problems = [e['problem'] for e in ds]
+
+    # Resolve API bases and keys with fallback: prover -> eval
+    prover_base_url = args.prover_base_url
+    prover_api_key = args.prover_api_key
+
+    eval_base_url = args.eval_base_url or prover_base_url
+    eval_api_key = args.eval_api_key or prover_api_key
+
+    prover = NaiveProver(
+        api_base=prover_base_url,
+        api_key=prover_api_key,
+        model=args.proof_model,
+    )
+
+    logdir = get_current_log_path(args.log_dir)
+    logdir.mkdir(parents=True, exist_ok=True)
+
+    # Collect proofs unless verifier_samples is provided
+    if args.verifier_samples:
+        striped_proofs = [strip_think_simple(proof) for proof in proofs]
+        logger.info("Using preloaded proofs from verifier_samples, skipping prover generation")
+    else:
+        proofs = prover(
+            problems,
+            reasoning_effort=args.reasoning_effort,
+            enable_thinking=args.enable_thinking,
+        )
+        striped_proofs = [strip_think_simple(proof) for proof in proofs]
+        logger.info("successfully collected %d proofs from %s", len(proofs), args.proof_model)
+
+    if args.reviewer == "pessimistic":
+        # Use the new PessimisticVerifier (first error wins, also records majority vote)
+        evaluator = PessimisticVerifier(eval_base_url, eval_api_key, args.eval_model, review_times=args.reviews)
+    elif args.reviewer == "vpessimistic":
+        # Chunked pessimistic verifier (focus per-chunk)
+        evaluator = VPessimisticVerifier(eval_base_url, eval_api_key, args.eval_model, chunk_length=args.chunk_length)
+    elif args.reviewer == "progressive":
+        # Progressive chunking: coarse-to-fine pessimistic verifier
+        evaluator = ProgressivePessimisticVerifier(
+            eval_base_url,
+            eval_api_key,
+            args.eval_model,
+            max_iters=args.progressive_max_iters,
+            min_chunk_size=args.progressive_min_chunk_size,
+        )
+    elif args.reviewer == "ppruning":
+        evaluator = PessimisticPruningVerifier(
+            eval_base_url,
+            eval_api_key,
+            args.eval_model,
+            review_times=args.reviews,
+        )
+    else:
+        evaluator = Verifier(eval_base_url, eval_api_key, args.eval_model)
+    eval_call_kwargs = {
+        "reasoning_effort": args.reasoning_effort,
+        "enable_thinking": args.enable_thinking,
+    }
+    if args.reviewer in {"pessimistic", "ppruning"}:
+        eval_call_kwargs["ground_truth_labels"] = preloaded_gt_labels
+
+    evals, verifications = evaluator(
+        problems,
+        striped_proofs,
+        **eval_call_kwargs,
+    )
+    accuracy = sum(evals) / len(evals)
+    logger.info(f"Obtained final accuracy: {accuracy}")
+
+    majority_evals = None
+    majority_verifications = None
+    majority_accuracy = None
+    pess_family = args.reviewer in {"pessimistic", "ppruning"}
+    if pess_family:
+        majority_results = getattr(evaluator, "last_majority_results", None)
+        if majority_results:
+            majority_evals, majority_verifications = majority_results
+            if len(majority_evals) == len(evals) and len(evals) > 0:
+                majority_accuracy = sum(majority_evals) / len(majority_evals)
+                logger.info(f"Majority voting accuracy from the same reviews: {majority_accuracy}")
+        else:
+            majority_evals = None
+            majority_verifications = None
+
+        if args.reviewer == "pessimistic":
+            step_logs = getattr(evaluator, "stepwise_review_logs", None)
+            if step_logs:
+                step_log_path = logdir / "pessimistic_step_metrics.json"
+                with step_log_path.open("w", encoding="utf-8") as f:
+                    json.dump(step_logs, f, ensure_ascii=False, indent=2, default=str)
+                logger.info("Saved stepwise pessimistic review metrics to %s", step_log_path)
+
+            majority_step_logs = getattr(evaluator, "majority_step_logs", None)
+            majority_metrics = None
+            if (
+                preloaded_gt_labels
+                and majority_evals
+                and len(majority_evals) == len(preloaded_gt_labels)
+            ):
+                gt_vector = [1 if bool(x) else 0 for x in preloaded_gt_labels]
+                majority_preds = [1 if bool(x) else 0 for x in majority_evals]
+                majority_metrics = _compute_binary_metrics(majority_preds, gt_vector)
+
+            if majority_step_logs or majority_metrics:
+                majority_log_path = logdir / "pessimistic_majority_metrics.json"
+                payload = {}
+                if majority_step_logs:
+                    payload["steps"] = majority_step_logs
+                if majority_metrics:
+                    payload["metrics"] = majority_metrics
+                with majority_log_path.open("w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+                logger.info("Saved pessimistic majority metrics to %s", majority_log_path)
+
+
+    logger.info("Evaluating reviewer against ground truth")
+    if args.verifier_samples:
+        # Use ground-truth labels/texts from the provided verifier_samples file
+        gt_labels = preloaded_gt_labels
+        gt_texts = preloaded_gt_texts
+        logger.info("Using GT labels from verifier_samples; skipping new GT verification")
+    else:
+        gt_labels = [1] * len(evals)
+
+    preds = [int(x) for x in evals]
+    gts = [int(x) for x in gt_labels]
+    verifier_eval = _compute_binary_metrics(preds, gts)
+
+    if pess_family and majority_evals and len(majority_evals) == len(preds):
+        majority_preds = [int(x) for x in majority_evals]
+        verifier_eval["majority_vote_metrics"] = _compute_binary_metrics(majority_preds, gts)
+
+    pred_history = getattr(evaluator, "iteration_prediction_history", [])
+    if pred_history:
+        resolved_history = getattr(evaluator, "iteration_resolved_predictions", [])
+        pending_masks = getattr(evaluator, "iteration_pending_masks", [])
+        review_costs = getattr(evaluator, "iteration_review_costs", [])
+        iteration_metrics = []
+        total_samples = len(gts)
+        for idx, preds_if_stop in enumerate(pred_history):
+            iteration_index = idx + 1
+            metrics_if_stop = _compute_binary_metrics(preds_if_stop, gts)
+            resolved_preds = resolved_history[idx] if idx < len(resolved_history) else [None] * total_samples
+            resolved_metrics = _compute_binary_metrics(resolved_preds, gts)
+            pending_mask = pending_masks[idx] if idx < len(pending_masks) else [False] * total_samples
+            pending_samples = sum(1 for flag in pending_mask if flag)
+            cost_info = review_costs[idx] if idx < len(review_costs) else {}
+            iteration_metrics.append({
+                "iteration_index": iteration_index,
+                "metrics_if_stopped": metrics_if_stop,
+                "resolved_metrics": resolved_metrics,
+                "pending_samples": pending_samples,
+                "resolved_samples": total_samples - pending_samples,
+                "reviews_this_iter": cost_info.get("reviews_this_iter"),
+                "cumulative_reviews": cost_info.get("cumulative_reviews"),
+                "avg_input_tokens_this_iter": cost_info.get("avg_input_tokens_this_iter"),
+                "avg_output_tokens_this_iter": cost_info.get("avg_output_tokens_this_iter"),
+                "avg_input_tokens_cumulative": cost_info.get("avg_input_tokens_cumulative"),
+                "avg_output_tokens_cumulative": cost_info.get("avg_output_tokens_cumulative"),
+            })
+        if iteration_metrics:
+            key_name = "progressive_iteration_metrics" if args.reviewer == "progressive" else f"{args.reviewer}_iteration_metrics"
+            verifier_eval[key_name] = iteration_metrics
+
+        # Save sample-level comparison
+        majority_sample_fields = None
+        if (
+            pess_family
+            and majority_evals
+            and majority_verifications
+            and len(majority_evals) == len(gts)
+            and len(majority_verifications) == len(gts)
+        ):
+            majority_sample_fields = list(zip(
+                [bool(int(x)) for x in majority_evals],
+                majority_verifications,
+            ))
+
+        verifier_samples = []
+        for idx, (problem, proof, pred, pred_text, gt, gt_text) in enumerate(
+            zip(problems, proofs, preds, verifications, gts, gt_texts)
+        ):
+            sample_entry = {
+                "problem": problem,
+                "proof": proof,
+                "pred_label": bool(pred),
+                "pred_text": pred_text,
+                "gt_label": bool(gt),
+                "gt_text": gt_text,
+            }
+            if majority_sample_fields:
+                maj_label, maj_text = majority_sample_fields[idx]
+                sample_entry["majority_pred_label"] = maj_label
+                sample_entry["majority_pred_text"] = maj_text
+            verifier_samples.append(sample_entry)
+
+        with open(logdir / "verifier_eval.json", "w", encoding="utf-8") as f:
+            json.dump(verifier_eval, f, ensure_ascii=False, indent=2, default=str)
+        with open(logdir / "verifier_samples.json", "w", encoding="utf-8") as f:
+            json.dump(verifier_samples, f, ensure_ascii=False, indent=2, default=str)
+
+        # Add summary to logs.json payload
+        vars_dict_key = "verifier_evaluation"
+        # vars_dict defined below; collect into a temporary dict for later merge
+        extra_verifier_eval = {vars_dict_key: verifier_eval}
+
+
+    logger.info("evaluation ended")
+    vars_dict = vars(args)
+    vars_dict["accuracy"] = accuracy
+    if majority_accuracy is not None:
+        vars_dict["majority_accuracy"] = majority_accuracy
+    # Reviewer cost metrics for post-hoc cost/performance analysis
+    reviewer_cost = {"reviewer": args.reviewer}
+    num_samples = len(problems)
+    if args.reviewer in {"vpessimistic", "progressive", "ppruning"}:
+        if args.reviewer == "vpessimistic":
+            counts = getattr(evaluator, "last_chunk_counts", []) or []
+        else:
+            counts = getattr(evaluator, "last_review_counts", []) or []
+        total_reviews = sum(counts)
+        avg_per_sample = (total_reviews / len(counts)) if counts else 0.0
+        reviewer_cost.update({
+            "total_reviews": total_reviews,
+            "avg_reviews_per_sample": avg_per_sample,
+            "min_reviews_per_sample": (min(counts) if counts else 0),
+            "max_reviews_per_sample": (max(counts) if counts else 0),
+        })
+    else:
+        if args.reviewer == "standard":
+            per_sample = 1
+        elif args.reviewer == "pessimistic":
+            per_sample = int(args.reviews)
+        else:
+            per_sample = 1
+        reviewer_cost.update({
+            "reviews_per_sample": per_sample,
+            "total_reviews": per_sample * num_samples,
+        })
+    vars_dict["reviewer_cost"] = reviewer_cost
+    # Token stats: skip prover token stats when using preloaded samples
+    if args.verifier_samples:
+        average_prover_inp_tokens = None
+        average_prover_opt_tokens = None
+    else:
+        average_prover_inp_tokens = (
+            sum(prover.client.input_tokens) / len(prover.client.input_tokens)
+            if prover.client.input_tokens else 0.0
+        )
+        average_prover_opt_tokens = (
+            sum(prover.client.comp_tokens) / len(prover.client.comp_tokens)
+            if prover.client.comp_tokens else 0.0
+        )
+    average_eval_inp_tokens = (
+        sum(evaluator.client.input_tokens) / len(evaluator.client.input_tokens)
+        if evaluator.client.input_tokens else 0.0
+    )
+    average_eval_opt_tokens = (
+        sum(evaluator.client.comp_tokens) / len(evaluator.client.comp_tokens)
+        if evaluator.client.comp_tokens else 0.0
+    )
+    logger.info(f"Average token inputs in prover: {average_prover_inp_tokens}")
+    logger.info(f"Average completion tokens in prover: {average_prover_opt_tokens}")
+    logger.info(f"Average token inputs in evaluator: {average_eval_inp_tokens}")
+    logger.info(f"Average completion inputs in evaluator: {average_eval_opt_tokens}")
+    vars_dict["average_prover_inp_tokens"] = average_prover_inp_tokens
+    vars_dict["average_prover_opt_tokens"] = average_prover_opt_tokens
+    vars_dict["average_eval_inp_tokens"] = average_eval_inp_tokens
+    vars_dict["average_eval_opt_tokens"] = average_eval_opt_tokens
+
+    # Merge verifier evaluation summary if available
+    try:
+        if 'extra_verifier_eval' in locals():
+            vars_dict.update(extra_verifier_eval)
+    except Exception:
+        pass
+
+    with open(logdir / "logs.json", "w", encoding="utf-8") as f:
+        json.dump(vars_dict, f, ensure_ascii=False, indent=2, default=str)
+
+    # Prepare sample payload; use placeholder tokens if verifier_samples is provided
+    if args.verifier_samples:
+        prover_inp_tokens = [None] * len(problems)
+        prover_comp_tokens = [None] * len(problems)
+    else:
+        prover_inp_tokens = prover.client.last_input_tokens
+        prover_comp_tokens = prover.client.last_comp_tokens
+
+    samples = [
+        {
+            "problem": problem,
+            "proof": proof,
+            "eval": eval,
+            "verification": verification,
+            "input_tokens": inp_tokens,
+            "completion_tokens": comp_tokens
+        }
+        for (problem, proof, eval, verification, inp_tokens, comp_tokens) in zip(
+            problems, proofs, evals, verifications, prover_inp_tokens, prover_comp_tokens
+        )
+    ]
+    if majority_evals and majority_verifications and len(samples) == len(majority_evals):
+        for sample, maj_eval, maj_verification in zip(samples, majority_evals, majority_verifications):
+            sample["majority_eval"] = maj_eval
+            sample["majority_verification"] = maj_verification
+
+    with open(logdir / "samples.json", "w", encoding="utf-8") as f:
+        json.dump(samples, f, ensure_ascii=False, indent=2, default=str)
+
+    if args.reviewer in {"progressive", "ppruning"}:
+        prefix = "progressive" if args.reviewer == "progressive" else "ppruning"
+        save_progressive_iteration_samples(
+            logdir,
+            getattr(evaluator, "iteration_samples_log", []),
+            problems,
+            proofs,
+            striped_proofs,
+            getattr(evaluator, "iteration_summary", []),
+            getattr(evaluator, "iteration_review_costs", []),
+            prefix=prefix,
+        )
+    logger.info(f"successfully saved logs to path {logdir}")
+
+if __name__ == "__main__":
+    LOG_FMT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    DATE_FMT = "%Y-%m-%d %H:%M:%S"
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format=LOG_FMT,
+        datefmt=DATE_FMT,
+        force=True
+    )
+    logger = logging.getLogger(__name__)
+    logger.info("Program Started")
+    main()
