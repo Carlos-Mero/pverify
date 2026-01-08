@@ -129,7 +129,14 @@ class ProverPipeline:
             if self.reviewer_type in {"pessimistic", "ppruning"}:
                  eval_kwargs["ground_truth_labels"] = None
 
-            evals, verifications = await self.reviewer.verify_async(problems, current_proofs, **eval_kwargs)
+            evals, verifications, review_costs = await self.reviewer.verify_async(problems, current_proofs, **eval_kwargs)
+            
+            # Update problem stats with review costs
+            if review_costs and len(review_costs) == len(problems):
+                for i, cost in enumerate(review_costs):
+                    problem_stats[i]["api_calls"] += cost.get("api_calls", 0)
+                    problem_stats[i]["cum_input_tokens"] += cost.get("input_tokens", 0)
+                    problem_stats[i]["cum_output_tokens"] += cost.get("output_tokens", 0)
             
             pass_count = sum(1 for e in evals if e == 1.0)
             self.logger.info(f"Iteration {iteration}: {pass_count}/{len(problems)} passed.")

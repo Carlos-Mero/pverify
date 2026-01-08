@@ -33,10 +33,29 @@ class Verifier():
         ]
         results = await self.client.infer_batch_async(all_messages, **kwargs)
         rewards = [1.0 if extract_xml_content(r, "verification") == "true" else 0.0 for r in results]
-        return rewards, results
+        
+        # Calculate costs
+        costs = []
+        inputs = getattr(self.client, "last_input_tokens", [])
+        outputs = getattr(self.client, "last_comp_tokens", [])
+        # Ensure lengths match problems even if some calls failed
+        if len(inputs) != len(problems):
+             inputs = [0] * len(problems)
+        if len(outputs) != len(problems):
+             outputs = [0] * len(problems)
+
+        for i in range(len(problems)):
+            costs.append({
+                "api_calls": 1,
+                "input_tokens": inputs[i],
+                "output_tokens": outputs[i]
+            })
+
+        return rewards, results, costs
 
     def __call__(self, problems, completions, **kwargs):
-        return ASYNC_LOOP.run(self.verify_async(problems, completions, **kwargs))
+        rewards, results, _ = ASYNC_LOOP.run(self.verify_async(problems, completions, **kwargs))
+        return rewards, results
 
 class PessimisticVerifier():
     """
@@ -199,8 +218,29 @@ class PessimisticVerifier():
         # Only perform parallel reviews and take the first error as verdict
         review_messages = self._review_messages(problems, completions)
         all_reviews = await self.client.infer_batch_async(review_messages, **kwargs)
+        
+        # Calculate costs
+        costs = []
+        inputs = getattr(self.client, "last_input_tokens", [])
+        outputs = getattr(self.client, "last_comp_tokens", [])
+        expected_len = len(problems) * self.review_times
+        if len(inputs) != expected_len:
+             inputs = [0] * expected_len
+        if len(outputs) != expected_len:
+             outputs = [0] * expected_len
+             
         k = self.review_times
         grouped = [all_reviews[i * k:(i + 1) * k] for i in range(len(problems))]
+        
+        for i in range(len(problems)):
+            start = i * k
+            end = (i + 1) * k
+            costs.append({
+                "api_calls": k,
+                "input_tokens": sum(inputs[start:end]),
+                "output_tokens": sum(outputs[start:end])
+            })
+
         verdicts_per_sample = [
             [extract_xml_content(r, "verification") for r in reviews]
             for reviews in grouped
@@ -233,10 +273,11 @@ class PessimisticVerifier():
         self._record_stepwise_logs(verdicts_per_sample, ground_truth_labels)
         self._record_majority_step_logs(verdicts_per_sample, ground_truth_labels)
 
-        return rewards, final_reviews
+        return rewards, final_reviews, costs
 
     def __call__(self, problems, completions, ground_truth_labels=None, **kwargs):
-        return ASYNC_LOOP.run(self.verify_async(problems, completions, ground_truth_labels=ground_truth_labels, **kwargs))
+        rewards, final_reviews, _ = ASYNC_LOOP.run(self.verify_async(problems, completions, ground_truth_labels=ground_truth_labels, **kwargs))
+        return rewards, final_reviews
 
 class PessimisticPruningVerifier():
     """
@@ -419,6 +460,9 @@ class PessimisticPruningVerifier():
 
     async def verify_async(self, problems, completions, ground_truth_labels=None, **kwargs):
         total = len(problems)
+        # Initialize costs
+        costs = [{"api_calls": 0, "input_tokens": 0, "output_tokens": 0} for _ in range(total)]
+        
         if total == 0:
             self.last_majority_results = ([], [])
             self.stepwise_review_logs = []
@@ -430,7 +474,7 @@ class PessimisticPruningVerifier():
             self.iteration_resolved_predictions = []
             self.iteration_pending_masks = []
             self.iteration_review_costs = []
-            return [], []
+            return [], [], costs
 
         base_messages = [self._build_base_message(problem, completion) for problem, completion in zip(problems, completions)]
         rewards: list[float | None] = [None] * total
@@ -474,6 +518,28 @@ class PessimisticPruningVerifier():
                 break
 
             iteration_reviews_raw = await self.client.infer_batch_async(batch_messages, **kwargs)
+            
+            # Accumulate costs
+            inputs = getattr(self.client, "last_input_tokens", [])
+            outputs = getattr(self.client, "last_comp_tokens", [])
+            if len(inputs) != len(batch_messages):
+                inputs = [0] * len(batch_messages)
+            if len(outputs) != len(batch_messages):
+                outputs = [0] * len(batch_messages)
+                
+            cursor_token = 0
+            for info in iteration_batch_info:
+                sample_idx = info["sample_index"]
+                count = info["num_reviews"]
+                # Sum tokens for this sample's reviews in this iteration
+                s_inp = sum(inputs[cursor_token : cursor_token + count])
+                s_out = sum(outputs[cursor_token : cursor_token + count])
+                cursor_token += count
+                
+                costs[sample_idx]["api_calls"] += count
+                costs[sample_idx]["input_tokens"] += s_inp
+                costs[sample_idx]["output_tokens"] += s_out
+
             latest_input_tokens = getattr(self.client, "last_input_tokens", []) or []
             latest_comp_tokens = getattr(self.client, "last_comp_tokens", []) or []
             avg_input_tokens_this_iter = (
@@ -619,6 +685,10 @@ class PessimisticPruningVerifier():
         self._record_majority_step_logs(verdicts_history, ground_truth_labels)
         self.last_review_counts = total_review_counts
 
+        return rewards, final_reviews, costs
+
+    def __call__(self, problems, completions, ground_truth_labels=None, **kwargs):
+        rewards, final_reviews, _ = ASYNC_LOOP.run(self.verify_async(problems, completions, ground_truth_labels=ground_truth_labels, **kwargs))
         return rewards, final_reviews
 
     def __call__(self, problems, completions, ground_truth_labels=None, **kwargs):
@@ -707,6 +777,24 @@ class VPessimisticVerifier():
 
         # Run inference over all chunks
         all_chunk_reviews = await self.client.infer_batch_async(batch_messages, **kwargs)
+        
+        # Calculate costs
+        costs = []
+        inputs = getattr(self.client, "last_input_tokens", [])
+        outputs = getattr(self.client, "last_comp_tokens", [])
+        if len(inputs) != len(batch_messages):
+             inputs = [0] * len(batch_messages)
+        if len(outputs) != len(batch_messages):
+             outputs = [0] * len(batch_messages)
+
+        cursor = 0
+        for count in per_item_chunk_counts:
+            costs.append({
+                "api_calls": count,
+                "input_tokens": sum(inputs[cursor:cursor + count]),
+                "output_tokens": sum(outputs[cursor:cursor + count])
+            })
+            cursor += count
 
         # Group reviews by original sample
         grouped_reviews = []
@@ -737,10 +825,11 @@ class VPessimisticVerifier():
                 # If no errors, return a constant message instead of first review
                 final_texts.append(self.NO_ERROR_FALLBACK)
 
-        return evals, final_texts
+        return evals, final_texts, costs
 
     def __call__(self, problems, completions, **kwargs):
-        return ASYNC_LOOP.run(self.verify_async(problems, completions, **kwargs))
+        rewards, final_reviews, _ = ASYNC_LOOP.run(self.verify_async(problems, completions, **kwargs))
+        return rewards, final_reviews
 
 class ProgressivePessimisticVerifier():
     """
@@ -845,6 +934,9 @@ class ProgressivePessimisticVerifier():
 
     async def verify_async(self, problems, completions, **kwargs):
         total = len(problems)
+        # Initialize costs
+        costs = [{"api_calls": 0, "input_tokens": 0, "output_tokens": 0} for _ in range(total)]
+
         if total == 0:
             self.last_review_counts = []
             self.iteration_samples_log = []
@@ -853,7 +945,7 @@ class ProgressivePessimisticVerifier():
             self.iteration_resolved_predictions = []
             self.iteration_pending_masks = []
             self.iteration_review_costs = []
-            return [], []
+            return [], [], costs
 
         proofs = [strip_think_simple(c if isinstance(c, str) else c[0]['content']) for c in completions]
         evals: list[float | None] = [None] * total
@@ -905,7 +997,28 @@ class ProgressivePessimisticVerifier():
                 break
 
             chunk_reviews = await self.client.infer_batch_async(batch_messages, **kwargs)
-            # Token usage stats for this iteration and cumulatively so far
+            
+            # Accumulate costs
+            inputs = getattr(self.client, "last_input_tokens", [])
+            outputs = getattr(self.client, "last_comp_tokens", [])
+            if len(inputs) != len(batch_messages):
+                inputs = [0] * len(batch_messages)
+            if len(outputs) != len(batch_messages):
+                outputs = [0] * len(batch_messages)
+                
+            cursor_token = 0
+            for info in iteration_batch_info:
+                sample_idx = info["sample_index"]
+                count = info["num_chunks"]
+                # Sum tokens for this sample's chunks in this iteration
+                s_inp = sum(inputs[cursor_token : cursor_token + count])
+                s_out = sum(outputs[cursor_token : cursor_token + count])
+                cursor_token += count
+                
+                costs[sample_idx]["api_calls"] += count
+                costs[sample_idx]["input_tokens"] += s_inp
+                costs[sample_idx]["output_tokens"] += s_out
+
             latest_input_tokens = getattr(self.client, "last_input_tokens", []) or []
             latest_comp_tokens = getattr(self.client, "last_comp_tokens", []) or []
             avg_input_tokens_this_iter = (
@@ -1061,7 +1174,8 @@ class ProgressivePessimisticVerifier():
                 })
 
         self.last_review_counts = total_review_counts
-        return evals, final_texts
+        return evals, final_texts, costs
 
     def __call__(self, problems, completions, **kwargs):
-        return ASYNC_LOOP.run(self.verify_async(problems, completions, **kwargs))
+        rewards, final_reviews, _ = ASYNC_LOOP.run(self.verify_async(problems, completions, **kwargs))
+        return rewards, final_reviews

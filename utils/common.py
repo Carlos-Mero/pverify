@@ -349,8 +349,8 @@ class LLMClient():
                 raise RuntimeError(f"Task {i} failed") from r
         logger.info("completed batch inference on %d samples",  len(all_messages))
         completions = [r.choices[0].message["content"] if r is not None else "" for r  in raw_results]
-        batch_input_tokens = [r.usage.prompt_tokens for r in raw_results if r is not None]
-        batch_comp_tokens = [r.usage.completion_tokens for r in raw_results if r is not None]
+        batch_input_tokens = [r.usage.prompt_tokens if r is not None else 0 for r in raw_results]
+        batch_comp_tokens = [r.usage.completion_tokens if r is not None else 0 for r in raw_results]
         self.last_input_tokens = batch_input_tokens
         self.last_comp_tokens = batch_comp_tokens
         self.input_tokens.extend(batch_input_tokens)
