@@ -10,7 +10,8 @@ from utils.common import (
     prepare_dataset,
     get_current_log_path,
     strip_think_simple,
-    extract_xml_content
+    extract_xml_content,
+    batch_check_correctness
 )
 from utils.verifiers import (
     Verifier,
@@ -72,6 +73,7 @@ class ProverPipeline:
         self.logger.info(f"Loading dataset from {self.dataset_path}")
         ds = prepare_dataset(self.dataset_path)
         problems = [e['problem'] for e in ds]
+        gt_answers = ds['gt_answer'] if 'gt_answer' in ds.column_names else None
         
         # Track state
         current_proofs = [""] * len(problems)
@@ -117,37 +119,76 @@ class ProverPipeline:
             problem_stats[i]["cum_output_tokens"] += last_outputs[i]
         
         # 3. Refinement Loop
+        passed_indices = set()
+        current_evals = [0.0] * len(problems)
+        current_verifications = [""] * len(problems)
+
         for iteration in range(self.max_refine_iters + 1):
             self.logger.info(f"--- Iteration {iteration} ---")
             
             # Verify proofs
-            self.logger.info(f"Verifying {len(problems)} proofs...")
-            eval_kwargs = {
-                "reasoning_effort": self.args.reasoning_effort,
-                "enable_thinking": self.args.enable_thinking,
-            }
-            if self.reviewer_type in {"pessimistic", "ppruning"}:
-                 eval_kwargs["ground_truth_labels"] = None
+            # Only verify proofs that haven't passed yet
+            indices_to_verify = [i for i in range(len(problems)) if i not in passed_indices]
+            
+            if not indices_to_verify:
+                self.logger.info("All proofs have passed previously. Skipping verification.")
+            else:
+                self.logger.info(f"Verifying {len(indices_to_verify)} proofs...")
+                
+                subset_problems = [problems[i] for i in indices_to_verify]
+                subset_proofs = [current_proofs[i] for i in indices_to_verify]
+                
+                eval_kwargs = {
+                    "reasoning_effort": self.args.reasoning_effort,
+                    "enable_thinking": self.args.enable_thinking,
+                }
+                if self.reviewer_type in {"pessimistic", "ppruning"}:
+                     eval_kwargs["ground_truth_labels"] = None
 
-            evals, verifications, review_costs = await self.reviewer.verify_async(problems, current_proofs, **eval_kwargs)
+                subset_evals, subset_verifications, subset_costs = await self.reviewer.verify_async(subset_problems, subset_proofs, **eval_kwargs)
+                
+                # Update state with new verification results
+                for local_idx, original_idx in enumerate(indices_to_verify):
+                    res = subset_evals[local_idx]
+                    current_evals[original_idx] = res
+                    current_verifications[original_idx] = subset_verifications[local_idx]
+                    
+                    if res == 1.0:
+                        passed_indices.add(original_idx)
+                        
+                    # Update problem stats with review costs
+                    cost = subset_costs[local_idx]
+                    problem_stats[original_idx]["api_calls"] += cost.get("api_calls", 0)
+                    problem_stats[original_idx]["cum_input_tokens"] += cost.get("input_tokens", 0)
+                    problem_stats[original_idx]["cum_output_tokens"] += cost.get("output_tokens", 0)
             
-            # Update problem stats with review costs
-            if review_costs and len(review_costs) == len(problems):
-                for i, cost in enumerate(review_costs):
-                    problem_stats[i]["api_calls"] += cost.get("api_calls", 0)
-                    problem_stats[i]["cum_input_tokens"] += cost.get("input_tokens", 0)
-                    problem_stats[i]["cum_output_tokens"] += cost.get("output_tokens", 0)
-            
-            pass_count = sum(1 for e in evals if e == 1.0)
+            pass_count = len(passed_indices)
             self.logger.info(f"Iteration {iteration}: {pass_count}/{len(problems)} passed.")
+
+            # Calculate Ground Truth Accuracy if gt_answers exist
+            gt_accuracy = None
+            gt_correctness = []
+            if gt_answers:
+                # Prepare inputs for batch verification
+                # We need to strip thinking from proofs
+                stripped_proofs = [strip_think_simple(p) for p in current_proofs]
+                
+                # batch_check_correctness runs in separate processes
+                gt_correctness = batch_check_correctness(stripped_proofs, gt_answers)
+                
+                correct_count = sum(1 for x in gt_correctness if x)
+                gt_accuracy = correct_count / len(problems)
+                self.logger.info(f"Iteration {iteration}: Ground Truth Accuracy: {gt_accuracy:.2%} ({correct_count}/{len(problems)})")
             
             # Snapshot stats
             iteration_stats = {
                 "iteration": iteration,
                 "pass_rate": pass_count / len(problems),
+                "gt_accuracy": gt_accuracy,
+                "gt_correctness": gt_correctness if gt_answers else None,
                 "proofs": current_proofs[:], 
-                "evals": evals[:],
-                "verifications": verifications[:],
+                "evals": current_evals[:],
+                "verifications": current_verifications[:],
                 "problem_stats": [dict(s) for s in problem_stats]
             }
             accumulated_stats.append(iteration_stats)
@@ -166,7 +207,7 @@ class ProverPipeline:
             refinement_messages = []
             indices_to_refine = []
             
-            for i, (p, proof, result, feedback) in enumerate(zip(problems, current_proofs, evals, verifications)):
+            for i, (p, proof, result, feedback) in enumerate(zip(problems, current_proofs, current_evals, current_verifications)):
                 if result == 1.0:
                     continue # Already passed
                 

@@ -9,8 +9,40 @@ from litellm import acompletion
 from tqdm import tqdm
 from datasets import load_dataset, Dataset, concatenate_datasets
 from utils.async_runner import AsyncLoopThread
+from math_verify import parse, verify
+from concurrent.futures import ProcessPoolExecutor
 
 ASYNC_LOOP = AsyncLoopThread()
+
+def _verify_one_sample(args):
+    solution_str, gt_answer = args
+    try:
+        # math_verify.parse without timeout args relies on signal.alarm
+        # which works fine in a separate process (it has its own main thread)
+        candidates = parse(solution_str)
+        gold_parsed = parse(gt_answer)
+        return verify(candidates, gold_parsed)
+    except Exception as e:
+        # Logging inside process might need configuration, print strictly for debug
+        # or just return False
+        return False
+
+def batch_check_correctness(solutions: list[str], gt_answers: list[str]) -> list[bool]:
+    """
+    Check correctness of a batch of solutions against ground truth answers.
+    Uses ProcessPoolExecutor to avoid signal handling issues in threaded environments.
+    """
+    if not solutions:
+        return []
+    
+    # Pack arguments
+    args_list = list(zip(solutions, gt_answers))
+    
+    # Use ProcessPoolExecutor to run verification in separate processes
+    with ProcessPoolExecutor() as executor:
+        results = list(executor.map(_verify_one_sample, args_list))
+    
+    return results
 
 def extract_xml_content(text: str, tag: str):
     flags = re.DOTALL | 0
@@ -261,6 +293,11 @@ def prepare_dataset(dataset_path):
         ds = ds.add_column("proof", proofs)
         gt_evals = [False for e in ds]
         ds = ds.add_column("gt_eval", gt_evals)
+    elif dataset_path == "MathArena/apex_2025":
+        ds = load_dataset(dataset_path, split="train")
+        # Ensure we have 'problem' and 'gt_answer'
+        # The dataset has 'problem' and 'answer'
+        ds = ds.rename_column("answer", "gt_answer")
     else:
         raise NotImplementedError(f"Unknown dataset name or path: {dataset_path}")
 

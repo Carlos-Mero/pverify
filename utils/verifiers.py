@@ -691,9 +691,6 @@ class PessimisticPruningVerifier():
         rewards, final_reviews, _ = ASYNC_LOOP.run(self.verify_async(problems, completions, ground_truth_labels=ground_truth_labels, **kwargs))
         return rewards, final_reviews
 
-    def __call__(self, problems, completions, ground_truth_labels=None, **kwargs):
-        return ASYNC_LOOP.run(self.verify_async(problems, completions, ground_truth_labels=ground_truth_labels, **kwargs))
-
 class VPessimisticVerifier():
     """
     Chunked pessimistic verifier.
@@ -1057,13 +1054,10 @@ class ProgressivePessimisticVerifier():
                 chunk_lengths_this_iter.append(info["chunk_length"])
 
                 chunk_errors: list[str] = []
-                use_chunk_labels = info.get("mode") == "chunk"
                 for chunk_id, review in enumerate(sample_reviews, start=1):
                     verdict = extract_xml_content(review, "verification")
                     if verdict == "false":
                         formatted = strip_think_simple(review)
-                        if use_chunk_labels:
-                            formatted = f"[chunk {chunk_id}] {formatted}"
                         chunk_errors.append(formatted)
 
                 if chunk_errors:
