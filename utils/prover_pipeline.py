@@ -19,6 +19,7 @@ from utils.verifiers import (
     VPessimisticVerifier,
     ProgressivePessimisticVerifier,
     PessimisticPruningVerifier,
+    NoneVerifier,
 )
 
 class ProverPipeline:
@@ -61,6 +62,8 @@ class ProverPipeline:
                 reviewer_model,
                 review_times=args.reviews,
             )
+        elif self.reviewer_type == "none":
+            self.reviewer = NoneVerifier(reviewer_api_base, reviewer_api_key, reviewer_model)
         else:
             self.reviewer = Verifier(reviewer_api_base, reviewer_api_key, reviewer_model)
             

@@ -20,6 +20,7 @@ from utils.verifiers import (
     VPessimisticVerifier,
     ProgressivePessimisticVerifier,
     PessimisticPruningVerifier,
+    NoneVerifier,
 )
 from utils.prover_pipeline import ProverPipeline
 
@@ -32,7 +33,7 @@ def main():
     common_parser.add_argument("-em", "--eval_model", help="the model used for evaluation (if needed)", default="")
     common_parser.add_argument("--log_dir", help="the logging directory path", default="eval_logs")
     common_parser.add_argument("--reasoning_effort", help="the reasoning_effort parameter for some models", default="medium", choices=["minimal", "low", "medium", "high"])
-    common_parser.add_argument("--reviewer", default="standard", choices=["standard", "pessimistic", "vpessimistic", "progressive", "ppruning"], help="the reviewer used for evaluation")
+    common_parser.add_argument("--reviewer", default="standard", choices=["standard", "pessimistic", "vpessimistic", "progressive", "ppruning", "none"], help="the reviewer used for evaluation")
     common_parser.add_argument("--reviews", type=int, default=3, help="maximum reviews per sample for multi-review verifiers (pessimistic/ppruning)")
     common_parser.add_argument("--chunk_length", type=int, default=7, help="lines per chunk for vpessimistic reviewer")
     common_parser.add_argument("--progressive_max_iters", type=int, default=3, help="maximum refinement passes for progressive reviewer")
@@ -189,6 +190,8 @@ def main():
             args.eval_model,
             review_times=args.reviews,
         )
+    elif args.reviewer == "none":
+        evaluator = NoneVerifier(eval_base_url, eval_api_key, args.eval_model)
     else:
         evaluator = Verifier(eval_base_url, eval_api_key, args.eval_model)
     eval_call_kwargs = {

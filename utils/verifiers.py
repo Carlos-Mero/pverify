@@ -1173,3 +1173,33 @@ class ProgressivePessimisticVerifier():
     def __call__(self, problems, completions, **kwargs):
         rewards, final_reviews, _ = ASYNC_LOOP.run(self.verify_async(problems, completions, **kwargs))
         return rewards, final_reviews
+
+class NoneVerifier():
+    """
+    A dummy verifier that always returns True (1.0).
+    It maintains the same interface as other verifiers but performs no actual verification.
+    """
+    def __init__(self, api_base, api_key, model):
+        # Initialize client to maintain compatibility if accessed elsewhere,
+        # though we won't use it for inference.
+        self.client = LLMClient(api_base, api_key, model)
+
+    async def verify_async(self, problems, completions, **kwargs):
+        # Always return 1.0 (True)
+        rewards = [1.0] * len(problems)
+        final_reviews = ["Verification skipped."] * len(problems)
+        
+        # Zero costs
+        costs = []
+        for _ in problems:
+            costs.append({
+                "api_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0
+            })
+        
+        return rewards, final_reviews, costs
+
+    def __call__(self, problems, completions, **kwargs):
+        rewards, final_reviews, _ = ASYNC_LOOP.run(self.verify_async(problems, completions, **kwargs))
+        return rewards, final_reviews
