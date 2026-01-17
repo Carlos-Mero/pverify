@@ -34,12 +34,14 @@ class ProverPipeline:
         reviewer_api_base: str,
         reviewer_api_key: str,
         max_refine_iters: int = 3,
+        resume_path: str = None,
     ):
         self.args = args
         self.dataset_path = dataset_path
         self.prover_model = prover_model
         self.prover_client = LLMClient(prover_api_base, prover_api_key, prover_model)
         self.max_refine_iters = max_refine_iters
+        self.resume_path = resume_path
         
         # Initialize Reviewer
         self.reviewer_type = args.reviewer
@@ -96,45 +98,80 @@ class ProverPipeline:
                 enable_thinking=self.args.enable_thinking
             )
 
-        # 2. Initial Proof Generation
-        self.logger.info("Generating initial proofs...")
-        
-        initial_messages = [
-            [{"role": "user", "content": f"Please provide a complete and rigorous solution to this problem:\n\n{p}"}]
-            for p in problems
-        ]
-        
-        current_proofs = await generate_proofs(initial_messages)
-        
-        # Update stats for initial generation
-        last_inputs = getattr(self.prover_client, "last_input_tokens", [0]*len(problems))
-        last_outputs = getattr(self.prover_client, "last_comp_tokens", [0]*len(problems))
-        
-        # Ensure lists are correct length (handle potential failures/empty returns)
-        if len(last_inputs) != len(problems):
-             last_inputs = [0] * len(problems)
-        if len(last_outputs) != len(problems):
-             last_outputs = [0] * len(problems)
-
-        for i in range(len(problems)):
-            problem_stats[i]["api_calls"] += 1
-            problem_stats[i]["cum_input_tokens"] += last_inputs[i]
-            problem_stats[i]["cum_output_tokens"] += last_outputs[i]
-        
-        # 3. Refinement Loop
+        # 2. Initial Proof Generation (or Resume)
+        start_iteration = 0
         passed_indices = set()
         current_evals = [0.0] * len(problems)
         current_verifications = [""] * len(problems)
 
-        for iteration in range(self.max_refine_iters + 1):
+        if self.resume_path:
+             self.logger.info(f"Resuming from {self.resume_path}")
+             resume_dir = Path(self.resume_path)
+             iter_files = list(resume_dir.glob("iteration_*.json"))
+             if not iter_files:
+                 raise ValueError(f"No iteration files found in {self.resume_path}")
+             
+             iter_files.sort(key=lambda p: int(p.stem.split("_")[-1]))
+             latest_file = iter_files[-1]
+             self.logger.info(f"Loading state from {latest_file}")
+             
+             with latest_file.open("r", encoding="utf-8") as f:
+                 accumulated_stats = json.load(f)
+             
+             last_stat = accumulated_stats[-1]
+             start_iteration = last_stat["iteration"]
+             current_proofs = last_stat["proofs"]
+             current_evals = last_stat["evals"]
+             current_verifications = last_stat["verifications"]
+             problem_stats_list = last_stat["problem_stats"]
+             for i, ps in enumerate(problem_stats_list):
+                 problem_stats[i] = ps
+                 
+             for i, val in enumerate(current_evals):
+                 if val == 1.0:
+                     passed_indices.add(i)
+            
+             self.logger.info(f"Resumed at iteration {start_iteration} with {len(passed_indices)} passed proofs.")
+             
+        else:
+            self.logger.info("Generating initial proofs...")
+            
+            initial_messages = [
+                [{"role": "user", "content": f"Please provide a complete and rigorous solution to this problem:\n\n{p}"}]
+                for p in problems
+            ]
+            
+            current_proofs = await generate_proofs(initial_messages)
+            
+            # Update stats for initial generation
+            last_inputs = getattr(self.prover_client, "last_input_tokens", [0]*len(problems))
+            last_outputs = getattr(self.prover_client, "last_comp_tokens", [0]*len(problems))
+            
+            # Ensure lists are correct length (handle potential failures/empty returns)
+            if len(last_inputs) != len(problems):
+                 last_inputs = [0] * len(problems)
+            if len(last_outputs) != len(problems):
+                 last_outputs = [0] * len(problems)
+
+            for i in range(len(problems)):
+                problem_stats[i]["api_calls"] += 1
+                problem_stats[i]["cum_input_tokens"] += last_inputs[i]
+                problem_stats[i]["cum_output_tokens"] += last_outputs[i]
+        
+        # 3. Refinement Loop
+        for iteration in range(start_iteration, self.max_refine_iters + 1):
             self.logger.info(f"--- Iteration {iteration} ---")
             
             # Verify proofs
-            # Only verify proofs that haven't passed yet
-            indices_to_verify = [i for i in range(len(problems)) if i not in passed_indices]
+            if self.resume_path and iteration == start_iteration:
+                 indices_to_verify = []
+                 self.logger.info("Skipping verification for resumed iteration.")
+            else:
+                 indices_to_verify = [i for i in range(len(problems)) if i not in passed_indices]
             
             if not indices_to_verify:
-                self.logger.info("All proofs have passed previously. Skipping verification.")
+                if not (self.resume_path and iteration == start_iteration):
+                    self.logger.info("All proofs have passed previously. Skipping verification.")
             else:
                 self.logger.info(f"Verifying {len(indices_to_verify)} proofs...")
                 
@@ -168,34 +205,37 @@ class ProverPipeline:
             pass_count = len(passed_indices)
             self.logger.info(f"Iteration {iteration}: {pass_count}/{len(problems)} passed.")
 
-            # Calculate Ground Truth Accuracy if gt_answers exist
-            gt_accuracy = None
-            gt_correctness = []
-            if gt_answers:
-                # Prepare inputs for batch verification
-                # We need to strip thinking from proofs
-                stripped_proofs = [strip_think_simple(p) for p in current_proofs]
+            if not (self.resume_path and iteration == start_iteration):
+                # Calculate Ground Truth Accuracy if gt_answers exist
+                gt_accuracy = None
+                gt_correctness = []
+                if gt_answers:
+                    # Prepare inputs for batch verification
+                    # We need to strip thinking from proofs
+                    stripped_proofs = [strip_think_simple(p) for p in current_proofs]
+                    
+                    # batch_check_correctness runs in separate processes
+                    gt_correctness = batch_check_correctness(stripped_proofs, gt_answers)
+                    
+                    correct_count = sum(1 for x in gt_correctness if x)
+                    gt_accuracy = correct_count / len(problems)
+                    self.logger.info(f"Iteration {iteration}: Ground Truth Accuracy: {gt_accuracy:.2%} ({correct_count}/{len(problems)})")
                 
-                # batch_check_correctness runs in separate processes
-                gt_correctness = batch_check_correctness(stripped_proofs, gt_answers)
-                
-                correct_count = sum(1 for x in gt_correctness if x)
-                gt_accuracy = correct_count / len(problems)
-                self.logger.info(f"Iteration {iteration}: Ground Truth Accuracy: {gt_accuracy:.2%} ({correct_count}/{len(problems)})")
-            
-            # Snapshot stats
-            iteration_stats = {
-                "iteration": iteration,
-                "pass_rate": pass_count / len(problems),
-                "gt_accuracy": gt_accuracy,
-                "gt_correctness": gt_correctness if gt_answers else None,
-                "proofs": current_proofs[:], 
-                "evals": current_evals[:],
-                "verifications": current_verifications[:],
-                "problem_stats": [dict(s) for s in problem_stats]
-            }
-            accumulated_stats.append(iteration_stats)
-            self._save_logs(iteration, accumulated_stats)
+                # Snapshot stats
+                iteration_stats = {
+                    "iteration": iteration,
+                    "pass_rate": pass_count / len(problems),
+                    "gt_accuracy": gt_accuracy,
+                    "gt_correctness": gt_correctness if gt_answers else None,
+                    "proofs": current_proofs[:], 
+                    "evals": current_evals[:],
+                    "verifications": current_verifications[:],
+                    "problem_stats": [dict(s) for s in problem_stats]
+                }
+                accumulated_stats.append(iteration_stats)
+                self._save_logs(iteration, accumulated_stats)
+            else:
+                self.logger.info(f"Skipping snapshot for resumed iteration {iteration}.")
 
             # Check termination
             if iteration >= self.max_refine_iters:

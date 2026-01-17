@@ -67,6 +67,7 @@ def main():
     prove_parser.add_argument("--dataset", required=True, help="Dataset to use (overrides -ed if present)")
     prove_parser.add_argument("--prover", required=True, help="Prover model name (overrides -pm if present)")
     prove_parser.add_argument("--refine_iters", type=int, default=3, help="Maximum number of refinement iterations")
+    prove_parser.add_argument("--resume", help="Path to a previous log directory to resume from")
     # Note: 'prove' will also use global args like --reviewer, --reviews, etc.
 
     logger = logging.getLogger("main")
@@ -100,7 +101,8 @@ def main():
             reviewer_model=args.eval_model or prover_model, # Default to prover if eval not set? or check if empty.
             reviewer_api_base=eval_base_url,
             reviewer_api_key=eval_api_key,
-            max_refine_iters=args.refine_iters
+            max_refine_iters=args.refine_iters,
+            resume_path=args.resume
         )
         
         ASYNC_LOOP.run(pipeline.run())
