@@ -256,7 +256,7 @@ class ProverPipeline:
                 
                 indices_to_refine.append(i)
                 msg = [
-                    {"role": "user", "content": f"Problem: {p}\n\nPrevious Proof:\n{proof}\n\nReviewer Feedback:\n{feedback}\n\nPlease provide a corrected and rigorous proof that addresses the reviewer's feedback."}
+                    {"role": "user", "content": f"Problem: {p}\n\nPrevious Proof:\n{proof}\n\nReviewer Feedback:\n{feedback}\n\nPlease provide a corrected and rigorous proof that addresses the reviewer's feedback. The refined proof must contain all detailed steps in the previous old proof, so that it could be viewed as a self-contained proof."}
                 ]
                 refinement_messages.append(msg)
             
