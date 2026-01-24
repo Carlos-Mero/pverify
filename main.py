@@ -134,7 +134,7 @@ def main():
                 raise ValueError("verifier_samples must be a list of sample dicts")
             problems = [s.get("problem", "") for s in loaded_verifier_samples]
             proofs = [s.get("proof", "") for s in loaded_verifier_samples]
-            preloaded_gt_labels = [bool(s.get("eval", False)) for s in loaded_verifier_samples]
+            preloaded_gt_labels = [bool(s.get("gt_label", False)) for s in loaded_verifier_samples]
             preloaded_gt_texts = [s.get("verification", "") for s in loaded_verifier_samples]
             logger.info("Loaded %d samples from verifier_samples: %s", len(problems), vs_path)
     else:
@@ -275,6 +275,8 @@ def main():
         verifier_eval["majority_vote_metrics"] = _compute_binary_metrics(majority_preds, gts)
 
     pred_history = getattr(evaluator, "iteration_prediction_history", [])
+    # Save sample-level comparison
+    majority_sample_fields = None
     if pred_history:
         resolved_history = getattr(evaluator, "iteration_resolved_predictions", [])
         pending_masks = getattr(evaluator, "iteration_pending_masks", [])
@@ -306,8 +308,6 @@ def main():
             key_name = "progressive_iteration_metrics" if args.reviewer == "progressive" else f"{args.reviewer}_iteration_metrics"
             verifier_eval[key_name] = iteration_metrics
 
-        # Save sample-level comparison
-        majority_sample_fields = None
         if (
             pess_family
             and majority_evals
@@ -320,33 +320,33 @@ def main():
                 majority_verifications,
             ))
 
-        verifier_samples = []
-        for idx, (problem, proof, pred, pred_text, gt, gt_text) in enumerate(
-            zip(problems, proofs, preds, verifications, gts, gt_texts)
-        ):
-            sample_entry = {
-                "problem": problem,
-                "proof": proof,
-                "pred_label": bool(pred),
-                "pred_text": pred_text,
-                "gt_label": bool(gt),
-                "gt_text": gt_text,
-            }
-            if majority_sample_fields:
-                maj_label, maj_text = majority_sample_fields[idx]
-                sample_entry["majority_pred_label"] = maj_label
-                sample_entry["majority_pred_text"] = maj_text
-            verifier_samples.append(sample_entry)
+    verifier_samples = []
+    for idx, (problem, proof, pred, pred_text, gt, gt_text) in enumerate(
+        zip(problems, proofs, preds, verifications, gts, gt_texts)
+    ):
+        sample_entry = {
+            "problem": problem,
+            "proof": proof,
+            "pred_label": bool(pred),
+            "pred_text": pred_text,
+            "gt_label": bool(gt),
+            "gt_text": gt_text,
+        }
+        if majority_sample_fields:
+            maj_label, maj_text = majority_sample_fields[idx]
+            sample_entry["majority_pred_label"] = maj_label
+            sample_entry["majority_pred_text"] = maj_text
+        verifier_samples.append(sample_entry)
 
-        with open(logdir / "verifier_eval.json", "w", encoding="utf-8") as f:
-            json.dump(verifier_eval, f, ensure_ascii=False, indent=2, default=str)
-        with open(logdir / "verifier_samples.json", "w", encoding="utf-8") as f:
-            json.dump(verifier_samples, f, ensure_ascii=False, indent=2, default=str)
+    with open(logdir / "verifier_eval.json", "w", encoding="utf-8") as f:
+        json.dump(verifier_eval, f, ensure_ascii=False, indent=2, default=str)
+    with open(logdir / "verifier_samples.json", "w", encoding="utf-8") as f:
+        json.dump(verifier_samples, f, ensure_ascii=False, indent=2, default=str)
 
-        # Add summary to logs.json payload
-        vars_dict_key = "verifier_evaluation"
-        # vars_dict defined below; collect into a temporary dict for later merge
-        extra_verifier_eval = {vars_dict_key: verifier_eval}
+    # Add summary to logs.json payload
+    vars_dict_key = "verifier_evaluation"
+    # vars_dict defined below; collect into a temporary dict for later merge
+    extra_verifier_eval = {vars_dict_key: verifier_eval}
 
 
     logger.info("evaluation ended")
