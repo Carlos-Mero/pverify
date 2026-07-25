@@ -236,7 +236,7 @@ def decrypt_h2eval_sample(example):
 
     return example
 
-def prepare_dataset(dataset_path):
+def prepare_dataset(dataset_path, arxiv_data_dir=None):
     logger = logging.getLogger("dataset")
     logger.info("preparing dataset at path: %s", dataset_path)
     if dataset_path == "NP_dataset/train_full.json" or dataset_path == "NP_dataset/train_3000.json" or dataset_path == "NP_dataset/test_hard.json" or dataset_path == "NP_dataset/test_random.json" or dataset_path == "NP_dataset/train_300.json":
@@ -298,6 +298,13 @@ def prepare_dataset(dataset_path):
         # Ensure we have 'problem' and 'gt_answer'
         # The dataset has 'problem' and 'answer'
         ds = ds.rename_column("answer", "gt_answer")
+    elif dataset_path == "LukeBailey181Pub/ArxivMathGradingBench":
+        # Import lazily because arxiv_bench's location judge uses LLMClient from
+        # this module.
+        from utils.arxiv_bench import DEFAULT_ARXIV_DATA_DIR, load_prepared_rows
+
+        rows = load_prepared_rows(arxiv_data_dir or DEFAULT_ARXIV_DATA_DIR)
+        ds = Dataset.from_list(rows)
     else:
         raise NotImplementedError(f"Unknown dataset name or path: {dataset_path}")
 

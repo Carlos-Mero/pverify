@@ -23,6 +23,12 @@ from utils.verifiers import (
     NoneVerifier,
 )
 from utils.prover_pipeline import ProverPipeline
+from utils.arxiv_bench import (
+    ARXIV_MATH_GRADING_BENCH,
+    DEFAULT_ARXIV_DATA_DIR,
+    ErrorLocationJudge,
+    compute_location_tnr,
+)
 
 def main():
     # Define common arguments in a parent parser
@@ -43,6 +49,26 @@ def main():
     common_parser.add_argument("--prover_api_key", default="", help="the api key for the prover")
     common_parser.add_argument("--eval_api_key", default="", help="the api key for the evaluator")
     common_parser.add_argument("--enable_thinking", action=argparse.BooleanOptionalAction, default=True, help="toggle enable_thinking parameter for models that support reasoning traces")
+    common_parser.add_argument(
+        "--arxiv_data_dir",
+        default=str(DEFAULT_ARXIV_DATA_DIR),
+        help="prepared ArxivMathGradingBench directory containing manifest.jsonl",
+    )
+    common_parser.add_argument(
+        "--location_judge_model",
+        default="",
+        help="independent error-location judge model (defaults to --eval_model)",
+    )
+    common_parser.add_argument(
+        "--location_judge_base_url",
+        default="",
+        help="location judge endpoint (defaults to evaluator endpoint)",
+    )
+    common_parser.add_argument(
+        "--location_judge_api_key",
+        default="",
+        help="location judge API key (defaults to evaluator key)",
+    )
     common_parser.add_argument(
         "--verifier_samples",
         default="",
@@ -117,8 +143,42 @@ def main():
     loaded_verifier_samples = None
     preloaded_gt_labels = None
     preloaded_gt_texts = None
-    if args.verifier_samples:
-        if args.verifier_samples == "Salesforce/Hard2Verify" or args.verifier_samples == "NP_dataset/gradingbench.csv":
+    dataset_metadata = []
+    is_arxiv_bench = (
+        args.verifier_samples == ARXIV_MATH_GRADING_BENCH
+        or (
+            not args.verifier_samples
+            and args.eval_dataset == ARXIV_MATH_GRADING_BENCH
+        )
+    )
+    if args.verifier_samples or is_arxiv_bench:
+        if is_arxiv_bench:
+            ds = prepare_dataset(
+                ARXIV_MATH_GRADING_BENCH,
+                arxiv_data_dir=args.arxiv_data_dir,
+            )
+            problems = ds["problem"]
+            proofs = ds["proof"]
+            preloaded_gt_labels = ds["gt_eval"]
+            preloaded_gt_texts = ds["gt_error_location"]
+            dataset_metadata = [
+                {
+                    "arxiv_id": row.get("arxiv_id"),
+                    "version": row.get("version"),
+                    "title": row.get("title_extracted_from_tex"),
+                    "ground_truth_error_location": row.get("gt_error_location"),
+                    "pdf_path": row.get("pdf_path"),
+                    "source_archive_path": row.get("source_archive_path"),
+                    "proof_path": row.get("proof_path"),
+                }
+                for row in ds
+            ]
+            logger.info(
+                "Loaded %d complete papers from prepared %s data",
+                len(problems),
+                ARXIV_MATH_GRADING_BENCH,
+            )
+        elif args.verifier_samples == "Salesforce/Hard2Verify" or args.verifier_samples == "NP_dataset/gradingbench.csv":
             ds = prepare_dataset(args.verifier_samples)
             problems = ds["problem"]
             proofs = ds["proof"]
@@ -158,7 +218,7 @@ def main():
     logdir.mkdir(parents=True, exist_ok=True)
 
     # Collect proofs unless verifier_samples is provided
-    if args.verifier_samples:
+    if args.verifier_samples or is_arxiv_bench:
         striped_proofs = [strip_think_simple(proof) for proof in proofs]
         logger.info("Using preloaded proofs from verifier_samples, skipping prover generation")
     else:
@@ -208,7 +268,7 @@ def main():
         striped_proofs,
         **eval_call_kwargs,
     )
-    accuracy = sum(evals) / len(evals)
+    accuracy = sum(evals) / len(evals) if evals else 0.0
     logger.info(f"Obtained final accuracy: {accuracy}")
 
     majority_evals = None
@@ -258,17 +318,54 @@ def main():
 
 
     logger.info("Evaluating reviewer against ground truth")
-    if args.verifier_samples:
+    if args.verifier_samples or is_arxiv_bench:
         # Use ground-truth labels/texts from the provided verifier_samples file
         gt_labels = preloaded_gt_labels
         gt_texts = preloaded_gt_texts
         logger.info("Using GT labels from verifier_samples; skipping new GT verification")
     else:
         gt_labels = [1] * len(evals)
+        gt_texts = [None] * len(evals)
 
     preds = [int(x) for x in evals]
     gts = [int(x) for x in gt_labels]
     verifier_eval = _compute_binary_metrics(preds, gts)
+
+    location_judgments = None
+    if is_arxiv_bench:
+        location_judge = ErrorLocationJudge(
+            api_base=args.location_judge_base_url or eval_base_url,
+            api_key=args.location_judge_api_key or eval_api_key,
+            model=args.location_judge_model or args.eval_model,
+        )
+        location_judgments = location_judge(
+            striped_proofs,
+            preds,
+            verifications,
+            list(preloaded_gt_texts),
+            reasoning_effort=args.reasoning_effort,
+            enable_thinking=args.enable_thinking,
+        )
+        location_matches = [entry["matched"] for entry in location_judgments]
+        verifier_eval["location_aware"] = compute_location_tnr(
+            preds,
+            location_matches,
+        )
+        verifier_eval["location_aware"]["judge_calls"] = sum(
+            1 for entry in location_judgments if entry["ran"]
+        )
+        verifier_eval["location_aware"]["judge_parse_failures"] = sum(
+            1
+            for entry in location_judgments
+            if entry["ran"] and not entry.get("parse_ok", False)
+        )
+        verifier_eval["location_judge_model"] = (
+            args.location_judge_model or args.eval_model
+        )
+        logger.info(
+            "ArxivMathGradingBench location-aware TNR: %.4f",
+            verifier_eval["location_aware"]["tnr"] or 0.0,
+        )
 
     if pess_family and majority_evals and len(majority_evals) == len(preds):
         majority_preds = [int(x) for x in majority_evals]
@@ -332,6 +429,10 @@ def main():
             "gt_label": bool(gt),
             "gt_text": gt_text,
         }
+        if dataset_metadata:
+            sample_entry["dataset_metadata"] = dataset_metadata[idx]
+        if location_judgments:
+            sample_entry["location_judgment"] = location_judgments[idx]
         if majority_sample_fields:
             maj_label, maj_text = majority_sample_fields[idx]
             sample_entry["majority_pred_label"] = maj_label
@@ -352,6 +453,11 @@ def main():
     logger.info("evaluation ended")
     vars_dict = vars(args)
     vars_dict["accuracy"] = accuracy
+    if is_arxiv_bench:
+        vars_dict["final_performance_metric"] = {
+            "name": "location_aware_tnr",
+            "value": verifier_eval["location_aware"]["tnr"],
+        }
     if majority_accuracy is not None:
         vars_dict["majority_accuracy"] = majority_accuracy
     # Reviewer cost metrics for post-hoc cost/performance analysis
@@ -383,7 +489,7 @@ def main():
         })
     vars_dict["reviewer_cost"] = reviewer_cost
     # Token stats: skip prover token stats when using preloaded samples
-    if args.verifier_samples:
+    if args.verifier_samples or is_arxiv_bench:
         average_prover_inp_tokens = None
         average_prover_opt_tokens = None
     else:
@@ -411,6 +517,16 @@ def main():
     vars_dict["average_prover_opt_tokens"] = average_prover_opt_tokens
     vars_dict["average_eval_inp_tokens"] = average_eval_inp_tokens
     vars_dict["average_eval_opt_tokens"] = average_eval_opt_tokens
+    if location_judgments:
+        vars_dict["location_judge_model"] = args.location_judge_model or args.eval_model
+        vars_dict["location_judge_average_input_tokens"] = (
+            sum(location_judge.client.input_tokens) / len(location_judge.client.input_tokens)
+            if location_judge.client.input_tokens else 0.0
+        )
+        vars_dict["location_judge_average_output_tokens"] = (
+            sum(location_judge.client.comp_tokens) / len(location_judge.client.comp_tokens)
+            if location_judge.client.comp_tokens else 0.0
+        )
 
     # Merge verifier evaluation summary if available
     try:
@@ -423,7 +539,7 @@ def main():
         json.dump(vars_dict, f, ensure_ascii=False, indent=2, default=str)
 
     # Prepare sample payload; use placeholder tokens if verifier_samples is provided
-    if args.verifier_samples:
+    if args.verifier_samples or is_arxiv_bench:
         prover_inp_tokens = [None] * len(problems)
         prover_comp_tokens = [None] * len(problems)
     else:
@@ -447,6 +563,12 @@ def main():
         for sample, maj_eval, maj_verification in zip(samples, majority_evals, majority_verifications):
             sample["majority_eval"] = maj_eval
             sample["majority_verification"] = maj_verification
+    if dataset_metadata:
+        for sample, metadata in zip(samples, dataset_metadata):
+            sample["dataset_metadata"] = metadata
+    if location_judgments:
+        for sample, judgment in zip(samples, location_judgments):
+            sample["location_judgment"] = judgment
 
     with open(logdir / "samples.json", "w", encoding="utf-8") as f:
         json.dump(samples, f, ensure_ascii=False, indent=2, default=str)

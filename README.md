@@ -21,6 +21,51 @@ You can start using this repo with the following steps:
 
 Note that if you want to evaluate the results in QZ bench, you need to firstly run a proof and evaluation via a strong verifier. You need to first run `scripts/qz_bench_gpt_5_mini_gen.sh` and pass its logging directory as `verifier_samples` in `scripts/qz_bench_gpt_5_mini_eval.sh`.
 
+## ArxivMathGradingBench
+
+The repository supports the 35-paper
+`LukeBailey181Pub/ArxivMathGradingBench` dataset. Prepare it once:
+
+```bash
+python scripts/prepare_arxiv_math_grading_bench.py
+```
+
+For the exact annotated arXiv version of every paper, this creates:
+
+- `pdfs/arXiv-<id><version>.pdf`: the complete rendered paper;
+- `source_archives/arXiv-<id><version>.src`: the original arXiv source response;
+- `sources/<id><version>/`: the safely extracted complete source tree;
+- `proof_bundles/arXiv-<id><version>.tex`: all textual TeX/BibTeX/style
+  sources concatenated without rewriting, with explicit file boundaries;
+- `manifest.jsonl`: metadata, paths, source-file lists, and SHA-256 hashes.
+
+Downloads are idempotent and retry transient network failures. Files are
+retrieved from arXiv under each paper's own recorded license and are therefore
+kept as local generated data rather than committed to this repository.
+
+Run an evaluation directly on the prepared proof bundles:
+
+```bash
+python main.py \
+  --eval_dataset LukeBailey181Pub/ArxivMathGradingBench \
+  --arxiv_data_dir NP_dataset/arxiv_math_grading_bench \
+  --reviewer pessimistic \
+  --reviews 4 \
+  --eval_model <verifier-model> \
+  --eval_base_url <base-url> \
+  --eval_api_key <api-key> \
+  --location_judge_model <independent-judge-model>
+```
+
+This dataset always skips proof generation: the complete source bundle is the
+candidate proof. If the verifier reports an error, a separate location-judge
+agent compares the report with the annotated `Location of Error`. At the paper
+level, a true negative requires both rejection and a matching error location.
+A pass, a wrong location, or an unparseable location judgment is a false
+positive. The resulting `tn`, `fp`, and `tnr = tn / (tn + fp)` are written to
+`verifier_eval.json` under `location_aware`; per-paper judge output is retained
+in `verifier_samples.json` and `samples.json`.
+
 **CLI Arguments**
 - `--eval_dataset, -ed` (str, default `""`): dataset path or HF name for evaluation; see `NP_dataset/` presets and `Salesforce/Hard2Verify`.
 - `--proof_model, -pm` (str, default `""`): model id used to generate proofs.
@@ -38,3 +83,6 @@ Note that if you want to evaluate the results in QZ bench, you need to firstly r
 - `--eval_api_key` (str, default `""`): API key for the evaluator endpoint (falls back to prover key when empty).
 - `--enable_thinking` / `--no-enable_thinking` (flag, default enabled): toggle provider-specific `enable_thinking` parameter.
 - `--verifier_samples` (str, default `""`): path or dataset name for precomputed problems/proofs (skips new proof generation and uses stored ground-truth labels when available).
+- `--arxiv_data_dir` (str): prepared ArxivMathGradingBench directory.
+- `--location_judge_model` (str): independent error-location judge; defaults to `--eval_model`.
+- `--location_judge_base_url` / `--location_judge_api_key`: optional endpoint overrides for the location judge.
