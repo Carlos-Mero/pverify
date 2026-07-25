@@ -2,33 +2,94 @@ import logging
 import random
 from utils.common import LLMClient, ASYNC_LOOP, extract_xml_content, strip_think_simple, _compute_binary_metrics
 
+
+def _completion_text(completion, *, preserve_verbatim: bool = False) -> str:
+    text = completion if isinstance(completion, str) else completion[0]["content"]
+    return text if preserve_verbatim else strip_think_simple(text)
+
+
+def _build_full_review_message(problem: str, completion) -> list[dict]:
+    """Build one full-input review request.
+
+    An empty problem selects whole-paper mode. In that mode the completion is
+    preserved verbatim and the reviewer is explicitly told that the research
+    questions and proofs are contained in the paper itself.
+    """
+
+    if not (problem or "").strip():
+        paper = _completion_text(completion, preserve_verbatim=True)
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You are a mathematical referee reviewing a complete research "
+                    "paper. The entire paper will be supplied as `paper_source`. "
+                    "Its research questions, theorem statements, and proofs are all "
+                    "contained in that source; there is intentionally no separate "
+                    "problem statement."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Review the complete paper below as one document and determine "
+                    "whether it contains a substantive mathematical error.\n\n"
+                    "Important input protocol:\n"
+                    "- `<problem>` is intentionally empty. Do not treat this as "
+                    "missing input and do not expect a separate exercise statement.\n"
+                    "- `<paper_source>` is the complete paper and is the sole object "
+                    "to verify. Read its own definitions, results, and proofs.\n"
+                    "- Check the paper globally, including dependencies between "
+                    "sections and labelled results.\n\n"
+                    "Check mathematical derivations, theorem hypotheses, unsupported "
+                    "assumptions, circular reasoning, and whether stated conclusions "
+                    "follow. Ignore purely stylistic, formatting, or harmless "
+                    "notational issues.\n\n"
+                    "If no substantive error is found, reply with "
+                    "`<verification>true</verification>` and a concise explanation. "
+                    "If an error is found, reply with "
+                    "`<verification>false</verification>`, identify its precise "
+                    "labelled location (theorem, proposition, lemma, equation, or "
+                    "proof passage), and concisely explain the mathematical flaw. "
+                    "Do not report missing input: the paper source is the complete "
+                    "input by design.\n\n"
+                    "<problem></problem>\n\n"
+                    f"<paper_source>{paper}</paper_source>"
+                ),
+            },
+        ]
+
+    answer = _completion_text(completion)
+    return [
+        {"role": "system", "content": (
+            "You are an assistant highly proficient in mathematics. The user will provide a math problem together with its proposed solution, and your task is to verify the correctness of that solution according to the given instruction."
+        )},
+        {"role": "user", "content": (
+            "Here is a math problem and a candidate solution of it, and you need to verify the correctness of this solution. Please check each of the following:\n\n"
+            "1. The provided content is indeed a math problem and its corresponding solution, rather than unrelated material supplied by mistake.\n"
+            "2. The solution actually derives the conclusion required by the original problem.\n"
+            "3. Every step of calculation and formula derivation in the solution is correct.\n"
+            "4. The hypotheses (conditions) and conclusions of any theorems used are correctly matched and applied.\n"
+            "5. The solution relies only on the conditions given in the problem and does not introduce any additional assumptions to obtain the conclusion.\n\n"
+            "Consistency and error-severity policy (important):\n"
+            "- If only minor, easily fixable issues exist (e.g., small algebraic slips later corrected, notational typos, superficial formatting), treat the solution as correct overall but briefly note such issues.\n"
+            "- If there is any critical error that undermines correctness (e.g., invalid step, wrong theorem usage without required conditions, uncorrected calculation error leading to a wrong result), treat the solution as incorrect.\n\n"
+            "Response requirements: If the solution is correct overall (possibly with minor issues), reply with `<verification>true</verification>` and briefly list minor issues if any."
+            " If the solution is incorrect, reply with `<verification>false</verification>` followed by a concise description of the most harmful error."
+            " Do not include any restatement of the entire solution or problem.\n\n"
+            f"<problem>{problem}</problem>\n\n"
+            f"<answer>{answer}</answer>"
+        )}
+    ]
+
+
 class Verifier():
     def __init__(self, api_base, api_key, model):
         self.client = LLMClient(api_base, api_key, model)
 
     async def verify_async(self, problems, completions, **kwargs):
         all_messages = [
-            [
-                {"role": "system", "content": (
-                    "You are an assistant highly proficient in mathematics. The user will provide a math problem together with its proposed solution, and your task is to verify the correctness of that solution according to the given instruction."
-                )},
-                {"role": "user", "content": (
-                    "Here is a math problem and a candidate solution of it, and you need to verify the correctness of this solution. Please check each of the following:\n\n"
-                    "1. The provided content is indeed a math problem and its corresponding solution, rather than unrelated material supplied by mistake.\n"
-                    "2. The solution actually derives the conclusion required by the original problem.\n"
-                    "3. Every step of calculation and formula derivation in the solution is correct.\n"
-                    "4. The hypotheses (conditions) and conclusions of any theorems used are correctly matched and applied.\n"
-                    "5. The solution relies only on the conditions given in the problem and does not introduce any additional assumptions to obtain the conclusion.\n\n"
-                    "Consistency and error-severity policy (important):\n"
-                    "- If only minor, easily fixable issues exist (e.g., small algebraic slips later corrected, notational typos, superficial formatting), treat the solution as correct overall but briefly note such issues.\n"
-                    "- If there is any critical error that undermines correctness (e.g., invalid step, wrong theorem usage without required conditions, uncorrected calculation error leading to a wrong result), treat the solution as incorrect.\n\n"
-                    "Response requirements: If the solution is correct overall (possibly with minor issues), reply with `<verification>true</verification>` and briefly list minor issues if any."
-                    " If the solution is incorrect, reply with `<verification>false</verification>` followed by a concise description of the most harmful error."
-                    " Do not include any restatement of the entire solution or problem.\n\n"
-                    f"<problem>{p}</problem>\n\n"
-                    f"<answer>{strip_think_simple(c if isinstance(c, str) else c[0]['content'])}</answer>"
-                )}
-            ]
+            _build_full_review_message(p, c)
             for (p, c) in zip(problems, completions)
         ]
         results = await self.client.infer_batch_async(all_messages, **kwargs)
@@ -69,34 +130,32 @@ class PessimisticVerifier():
         self.last_majority_results: tuple[list[float], list[str]] = ([], [])
         self.stepwise_review_logs: list[dict] = []
         self.majority_step_logs: list[dict] = []
+        self.last_request_audit: list[dict] = []
 
     def _review_messages(self, problems, completions):
         messages = []
-        for (p, c) in zip(problems, completions):
-            answer = strip_think_simple(c if isinstance(c, str) else c[0]['content'])
-            base = [
-                {"role": "system", "content": (
-                    "You are an assistant highly proficient in mathematics. The user will provide a math problem together with its proposed solution, and your task is to verify the correctness of that solution according to the given instruction."
-                )},
-                {"role": "user", "content": (
-                    "Here is a math problem and a candidate solution of it, and you need to verify the correctness of this solution. Please check each of the following:\n\n"
-                    "1. The provided content is indeed a math problem and its corresponding solution, rather than unrelated material supplied by mistake.\n"
-                    "2. The solution actually derives the conclusion required by the original problem.\n"
-                    "3. Every step of calculation and formula derivation in the solution is correct.\n"
-                    "4. The hypotheses (conditions) and conclusions of any theorems used are correctly matched and applied.\n"
-                    "5. The solution relies only on the conditions given in the problem and does not introduce any additional assumptions to obtain the conclusion.\n\n"
-                    "Consistency and error-severity policy (important):\n"
-                    "- If only minor, easily fixable issues exist (e.g., small algebraic slips later corrected, notational typos, superficial formatting), treat the solution as correct overall but briefly note such issues.\n"
-                    "- If there is any critical error that undermines correctness (e.g., invalid step, wrong theorem usage without required conditions, uncorrected calculation error leading to a wrong result), treat the solution as incorrect.\n\n"
-                    "Response requirements: If the solution is correct overall (possibly with minor issues), reply with `<verification>true</verification>` and briefly list minor issues if any."
-                    " If the solution is incorrect, reply with `<verification>false</verification>` followed by a concise description of the most harmful error."
-                    " Do not include any restatement of the entire solution or problem.\n\n"
-                    f"<problem>{p}</problem>\n\n"
-                    f"<answer>{answer}</answer>"
-                )}
-            ]
-            for _ in range(self.review_times):
+        audit = []
+        for sample_index, (p, c) in enumerate(zip(problems, completions)):
+            base = _build_full_review_message(p, c)
+            source = _completion_text(
+                c,
+                preserve_verbatim=not (p or "").strip(),
+            )
+            for review_index in range(self.review_times):
                 messages.append(base)
+                user_content = base[1]["content"]
+                audit.append({
+                    "sample_index": sample_index,
+                    "review_index": review_index + 1,
+                    "problem_empty": not bool((p or "").strip()),
+                    "proof_characters": len(source),
+                    "user_message_characters": len(user_content),
+                    "complete_proof_occurrences": (
+                        user_content.count(source) if source else 0
+                    ),
+                    "whole_paper_mode": "<paper_source>" in user_content,
+                })
+        self.last_request_audit = audit
         return messages
 
     def _majority_vote(self, reviews, verdicts):
@@ -322,28 +381,7 @@ class PessimisticPruningVerifier():
         return plan
 
     def _build_base_message(self, problem: str, completion) -> list[dict]:
-        answer = strip_think_simple(completion if isinstance(completion, str) else completion[0]['content'])
-        return [
-            {"role": "system", "content": (
-                "You are an assistant highly proficient in mathematics. The user will provide a math problem together with its proposed solution, and your task is to verify the correctness of that solution according to the given instruction."
-            )},
-            {"role": "user", "content": (
-                "Here is a math problem and a candidate solution of it, and you need to verify the correctness of this solution. Please check each of the following:\n\n"
-                "1. The provided content is indeed a math problem and its corresponding solution, rather than unrelated material supplied by mistake.\n"
-                "2. The solution actually derives the conclusion required by the original problem.\n"
-                "3. Every step of calculation and formula derivation in the solution is correct.\n"
-                "4. The hypotheses (conditions) and conclusions of any theorems used are correctly matched and applied.\n"
-                "5. The solution relies only on the conditions given in the problem and does not introduce any additional assumptions to obtain the conclusion.\n\n"
-                "Consistency and error-severity policy (important):\n"
-                "- If only minor, easily fixable issues exist (e.g., small algebraic slips later corrected, notational typos, superficial formatting), treat the solution as correct overall but briefly note such issues.\n"
-                "- If there is any critical error that undermines correctness (e.g., invalid step, wrong theorem usage without required conditions, uncorrected calculation error leading to a wrong result), treat the solution as incorrect.\n\n"
-                "Response requirements: If the solution is correct overall (possibly with minor issues), reply with `<verification>true</verification>` and briefly list minor issues if any."
-                " If the solution is incorrect, reply with `<verification>false</verification>` followed by a concise description of the most harmful error."
-                " Do not include any restatement of the entire solution or problem.\n\n"
-                f"<problem>{problem}</problem>\n\n"
-                f"<answer>{answer}</answer>"
-            )}
-        ]
+        return _build_full_review_message(problem, completion)
 
     def _majority_vote(self, reviews, verdicts):
         positives = sum(1 for v in verdicts if v == "true")

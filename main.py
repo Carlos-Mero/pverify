@@ -208,20 +208,27 @@ def main():
     eval_base_url = args.eval_base_url or prover_base_url
     eval_api_key = args.eval_api_key or prover_api_key
 
-    prover = NaiveProver(
-        api_base=prover_base_url,
-        api_key=prover_api_key,
-        model=args.proof_model,
-    )
+    prover = None
 
     logdir = get_current_log_path(args.log_dir)
     logdir.mkdir(parents=True, exist_ok=True)
 
     # Collect proofs unless verifier_samples is provided
     if args.verifier_samples or is_arxiv_bench:
-        striped_proofs = [strip_think_simple(proof) for proof in proofs]
-        logger.info("Using preloaded proofs from verifier_samples, skipping prover generation")
+        striped_proofs = (
+            list(proofs)
+            if is_arxiv_bench
+            else [strip_think_simple(proof) for proof in proofs]
+        )
+        logger.info(
+            "Using preloaded proofs; prover construction and generation are skipped"
+        )
     else:
+        prover = NaiveProver(
+            api_base=prover_base_url,
+            api_key=prover_api_key,
+            model=args.proof_model,
+        )
         proofs = prover(
             problems,
             reasoning_effort=args.reasoning_effort,
@@ -268,6 +275,17 @@ def main():
         striped_proofs,
         **eval_call_kwargs,
     )
+    if is_arxiv_bench:
+        request_audit = getattr(evaluator, "last_request_audit", None)
+        if request_audit is not None:
+            with (logdir / "reviewer_input_audit.json").open(
+                "w", encoding="utf-8"
+            ) as handle:
+                json.dump(request_audit, handle, ensure_ascii=False, indent=2)
+            logger.info(
+                "Saved %d reviewer input audit records confirming whole-paper payloads",
+                len(request_audit),
+            )
     accuracy = sum(evals) / len(evals) if evals else 0.0
     logger.info(f"Obtained final accuracy: {accuracy}")
 

@@ -57,14 +57,25 @@ python main.py \
   --location_judge_model <independent-judge-model>
 ```
 
-This dataset always skips proof generation: the complete source bundle is the
-candidate proof. If the verifier reports an error, a separate location-judge
-agent compares the report with the annotated `Location of Error`. At the paper
-level, a true negative requires both rejection and a matching error location.
-A pass, a wrong location, or an unparseable location judgment is a false
-positive. The resulting `tn`, `fp`, and `tnr = tn / (tn + fp)` are written to
-`verifier_eval.json` under `location_aware`; per-paper judge output is retained
-in `verifier_samples.json` and `samples.json`.
+This dataset always skips prover construction and proof generation. Its
+`problem` field is deliberately the empty string; the complete, verbatim source
+bundle is placed in `proof`. An empty problem activates whole-paper review
+mode: every pessimistic rollout receives the entire proof once inside
+`<paper_source>`, with instructions to treat the paper's own research questions,
+theorems, and proofs as the verification target.
+
+Each pessimistic run also writes `reviewer_input_audit.json`, recording the
+problem-empty flag, complete-paper character count, and number of times the
+paper occurred in every request. This makes accidental omission or duplication
+of the paper input directly auditable without duplicating the source in logs.
+
+If the verifier reports an error, a separate location-judge agent compares the
+report with the annotated `Location of Error`. At the paper level, a true
+negative requires both rejection and a matching error location. A pass, a wrong
+location, or an unparseable location judgment is a false positive. The resulting
+`tn`, `fp`, and `tnr = tn / (tn + fp)` are written to `verifier_eval.json` under
+`location_aware`; per-paper judge output is retained in
+`verifier_samples.json` and `samples.json`.
 
 **CLI Arguments**
 - `--eval_dataset, -ed` (str, default `""`): dataset path or HF name for evaluation; see `NP_dataset/` presets and `Salesforce/Hard2Verify`.

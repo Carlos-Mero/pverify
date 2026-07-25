@@ -74,11 +74,10 @@ def load_prepared_rows(
             resolved = resolve_data_path(data_dir, row.get(path_field))
             item[path_field] = str(resolved.resolve()) if resolved else ""
         item["proof"] = proof_path.read_text(encoding="utf-8")
-        item["problem"] = (
-            "Act as a mathematical referee. Verify the complete research paper below "
-            "and report any substantive mathematical error with its precise labelled "
-            "location (theorem, proposition, lemma, equation, or proof passage)."
-        )
+        # An empty problem is the explicit protocol signal for whole-paper review.
+        # The paper's research questions, theorem statements, and proofs all live
+        # inside `proof`; no synthetic problem statement or prover call is needed.
+        item["problem"] = ""
         # Every benchmark paper is the pre-correction version and is therefore negative
         # under pverify's convention that `True` means a correct proof.
         item["gt_eval"] = False
