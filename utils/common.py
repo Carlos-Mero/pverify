@@ -5,7 +5,7 @@ import logging
 import random
 from pathlib import Path
 from datetime import datetime, timezone
-from litellm import acompletion
+from litellm import acompletion, stream_chunk_builder
 from tqdm import tqdm
 from datasets import load_dataset, Dataset, concatenate_datasets
 from utils.async_runner import AsyncLoopThread
@@ -334,7 +334,7 @@ class LLMClient():
         while True:
             try:
                 async with sem:
-                    resp = await acompletion(
+                    stream = await acompletion(
                         model="openai/"+self.model,
                         messages=messages,
                         api_base=self.api_base,
@@ -343,7 +343,13 @@ class LLMClient():
                         temperature=1.0,
                         timeout=3600,
                         num_retries=7,
+                        stream=True,
+                        stream_options={"include_usage": True},
                         **kwargs)
+                    chunks = [chunk async for chunk in stream]
+                    resp = stream_chunk_builder(chunks=chunks, messages=messages)
+                    if resp is None:
+                        raise RuntimeError("Streaming response completed without any chunks")
                 return resp
             except Exception as e:
                 msg = str(e).lower()

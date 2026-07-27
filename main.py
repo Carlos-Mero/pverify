@@ -27,6 +27,7 @@ from utils.arxiv_bench import (
     ARXIV_MATH_GRADING_BENCH,
     DEFAULT_ARXIV_DATA_DIR,
     ErrorLocationJudge,
+    compute_iteration_location_metrics,
     compute_location_tnr,
 )
 
@@ -396,6 +397,15 @@ def main():
         resolved_history = getattr(evaluator, "iteration_resolved_predictions", [])
         pending_masks = getattr(evaluator, "iteration_pending_masks", [])
         review_costs = getattr(evaluator, "iteration_review_costs", [])
+        iteration_location_metrics = {}
+        if is_arxiv_bench and location_judgments is not None:
+            iteration_location_metrics = {
+                entry["iteration_index"]: entry["metrics"]
+                for entry in compute_iteration_location_metrics(
+                    pred_history,
+                    location_judgments,
+                )
+            }
         iteration_metrics = []
         total_samples = len(gts)
         for idx, preds_if_stop in enumerate(pred_history):
@@ -406,7 +416,7 @@ def main():
             pending_mask = pending_masks[idx] if idx < len(pending_masks) else [False] * total_samples
             pending_samples = sum(1 for flag in pending_mask if flag)
             cost_info = review_costs[idx] if idx < len(review_costs) else {}
-            iteration_metrics.append({
+            iteration_entry = {
                 "iteration_index": iteration_index,
                 "metrics_if_stopped": metrics_if_stop,
                 "resolved_metrics": resolved_metrics,
@@ -418,7 +428,12 @@ def main():
                 "avg_output_tokens_this_iter": cost_info.get("avg_output_tokens_this_iter"),
                 "avg_input_tokens_cumulative": cost_info.get("avg_input_tokens_cumulative"),
                 "avg_output_tokens_cumulative": cost_info.get("avg_output_tokens_cumulative"),
-            })
+            }
+            if iteration_index in iteration_location_metrics:
+                iteration_entry["location_aware_metrics"] = (
+                    iteration_location_metrics[iteration_index]
+                )
+            iteration_metrics.append(iteration_entry)
         if iteration_metrics:
             key_name = "progressive_iteration_metrics" if args.reviewer == "progressive" else f"{args.reviewer}_iteration_metrics"
             verifier_eval[key_name] = iteration_metrics

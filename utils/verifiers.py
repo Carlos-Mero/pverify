@@ -886,11 +886,13 @@ class ProgressivePessimisticVerifier():
         self.iteration_resolved_predictions: list[list[int | None]] = []
         self.iteration_pending_masks: list[list[bool]] = []
         self.iteration_review_costs: list[dict] = []
+        self.last_request_audit: list[dict] = []
 
         self.NO_ERROR_FALLBACK: str = (
             "<verification>true</verification>\n"
-            "No critical error found in this proof after progressive chunked review. "
-            "All passes (from coarse to fine) considered the solution correct overall. "
+            "No critical error found after progressive review. "
+            "All passes (from whole-input to focused chunks) considered the "
+            "submitted mathematical content correct overall. "
             "Minor, non-decisive issues may exist but do not undermine correctness."
         )
 
@@ -905,30 +907,51 @@ class ProgressivePessimisticVerifier():
         return chunks
 
     def _build_standard_messages_for_one(self, problem: str, full_proof: str) -> list[list[dict]]:
-        stripped_proof = strip_think_simple(full_proof)
-        return [[
-            {"role": "system", "content": (
-                "You are an assistant highly proficient in mathematics. The user will provide a math problem together with its proposed solution, and your task is to verify the correctness of that solution according to the given instruction."
-            )},
-            {"role": "user", "content": (
-                "Here is a math problem and a candidate solution of it, and you need to verify the correctness of this solution. Please check each of the following:\n\n"
-                "1. The provided content is indeed a math problem and its corresponding solution, rather than unrelated material supplied by mistake.\n"
-                "2. The solution actually derives the conclusion required by the original problem.\n"
-                "3. Every step of calculation and formula derivation in the solution is correct.\n"
-                "4. The hypotheses (conditions) and conclusions of any theorems used are correctly matched and applied.\n"
-                "5. The solution relies only on the conditions given in the problem and does not introduce any additional assumptions to obtain the conclusion.\n\n"
-                "Consistency and error-severity policy (important):\n"
-                "- If only minor, easily fixable issues exist (e.g., small algebraic slips later corrected, notational typos, superficial formatting), treat the solution as correct overall but briefly note such issues.\n"
-                "- If there is any critical error that undermines correctness (e.g., invalid step, wrong theorem usage without required conditions, uncorrected calculation error leading to a wrong result), treat the solution as incorrect.\n\n"
-                "Response requirements: If the solution is correct overall (possibly with minor issues), reply with `<verification>true</verification>` and briefly list minor issues if any."
-                " If the solution is incorrect, reply with `<verification>false</verification>` followed by a concise description of the most harmful error.\n\n"
-                f"<problem>{problem}</problem>\n\n"
-                f"<answer>{stripped_proof}</answer>"
-            )}
-        ]]
+        return [_build_full_review_message(problem, full_proof)]
 
     def _build_messages_for_one(self, problem: str, full_proof: str, chunk_length: int) -> list[list[dict]]:
         chunks = self._split_into_chunks(full_proof, chunk_length)
+        if not (problem or "").strip():
+            return [
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a mathematical referee performing a focused "
+                            "progressive verification pass over a complete research "
+                            "paper. The complete paper and one focus chunk are supplied."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "Check the designated chunk for substantive mathematical "
+                            "errors while using the complete paper for definitions, "
+                            "dependencies, notation, and global context.\n\n"
+                            "Important input protocol:\n"
+                            "- `<problem>` is intentionally empty; the paper contains "
+                            "its own research questions and results.\n"
+                            "- `<paper_source>` is the complete, verbatim paper. It is "
+                            "provided in every progressive request.\n"
+                            "- `<focus_chunk>` identifies the portion receiving close "
+                            "inspection in this pass. Do not treat it as a standalone "
+                            "proof and do not ignore relevant context elsewhere.\n\n"
+                            "If the focused passage contains no substantive error, "
+                            "reply with `<verification>true</verification>` and a "
+                            "concise explanation. If it contains an error, reply with "
+                            "`<verification>false</verification>`, give the precise "
+                            "labelled paper location, and explain the mathematical "
+                            "flaw. Ignore stylistic or harmless notational issues.\n\n"
+                            "<problem></problem>\n\n"
+                            f"<paper_source>{full_proof}</paper_source>\n\n"
+                            f"<chunk_index>{idx}</chunk_index>\n"
+                            f"<focus_chunk>{chunk}</focus_chunk>"
+                        ),
+                    },
+                ]
+                for idx, chunk in enumerate(chunks, start=1)
+            ]
+
         messages_per_chunk = []
         for idx, chunk in enumerate(chunks, start=1):
             messages_per_chunk.append([
@@ -980,9 +1003,16 @@ class ProgressivePessimisticVerifier():
             self.iteration_resolved_predictions = []
             self.iteration_pending_masks = []
             self.iteration_review_costs = []
+            self.last_request_audit = []
             return [], [], costs
 
-        proofs = [strip_think_simple(c if isinstance(c, str) else c[0]['content']) for c in completions]
+        proofs = [
+            _completion_text(
+                completion,
+                preserve_verbatim=not (problem or "").strip(),
+            )
+            for problem, completion in zip(problems, completions)
+        ]
         evals: list[float | None] = [None] * total
         final_texts = [""] * total
         pending_indices = list(range(total))
@@ -993,6 +1023,7 @@ class ProgressivePessimisticVerifier():
         self.iteration_resolved_predictions = []
         self.iteration_pending_masks = []
         self.iteration_review_costs = []
+        self.last_request_audit = []
         sample_states = [
             {
                 "status": "pending",
@@ -1019,6 +1050,23 @@ class ProgressivePessimisticVerifier():
                 else:
                     msgs = self._build_messages_for_one(problem, proof, chunk_length)
                     iteration_mode = "chunk"
+                for request_index, message in enumerate(msgs, start=1):
+                    user_content = message[1]["content"]
+                    self.last_request_audit.append({
+                        "sample_index": idx,
+                        "iteration_index": iteration + 1,
+                        "request_index": request_index,
+                        "mode": iteration_mode,
+                        "problem_empty": not bool((problem or "").strip()),
+                        "proof_characters": len(proof),
+                        "user_message_characters": len(user_content),
+                        "complete_proof_occurrences": (
+                            user_content.count(proof) if proof else 0
+                        ),
+                        "whole_paper_mode": "<paper_source>" in user_content,
+                        "chunk_length": chunk_length,
+                        "num_requests_for_sample": len(msgs),
+                    })
                 iteration_batch_info.append({
                     "sample_index": idx,
                     "chunk_length": chunk_length,

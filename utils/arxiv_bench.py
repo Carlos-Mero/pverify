@@ -116,16 +116,51 @@ def compute_location_tnr(
         if not predicted_correct and matched
     )
     fp = len(predictions) - tn
+    accuracy = (tn / len(predictions)) if predictions else None
     return {
         "total": len(predictions),
         "tn": tn,
         "fp": fp,
-        "tnr": (tn / len(predictions)) if predictions else None,
+        # Every ArxivMathGradingBench paper is a ground-truth negative, so
+        # location-aware accuracy and TNR have the same denominator.
+        "accuracy": accuracy,
+        "tnr": accuracy,
         "definition": (
             "TN iff the verifier reports an error and the location judge matches "
             "that report to an annotated `Location of Error`; all other papers are FP."
         ),
     }
+
+
+def compute_iteration_location_metrics(
+    prediction_history: Iterable[Iterable[bool | int | float]],
+    location_judgments: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Derive cumulative location-aware metrics after every verifier iteration.
+
+    Location reports are judged once at the end. A final matched judgment is
+    counted starting from the first iteration whose prediction history marks
+    that paper incorrect. This avoids repeated judge calls for the same report.
+    """
+
+    judgments = list(location_judgments)
+    final_matches = [bool(entry.get("matched", False)) for entry in judgments]
+    rows: list[dict[str, Any]] = []
+    previous_tn = 0
+    for iteration_index, predictions in enumerate(prediction_history, start=1):
+        prediction_list = list(predictions)
+        if len(prediction_list) != len(judgments):
+            raise ValueError(
+                "iteration prediction and location-judgment counts differ"
+            )
+        metrics = compute_location_tnr(prediction_list, final_matches)
+        metrics["new_tn_this_iteration"] = metrics["tn"] - previous_tn
+        previous_tn = metrics["tn"]
+        rows.append({
+            "iteration_index": iteration_index,
+            "metrics": metrics,
+        })
+    return rows
 
 
 class ErrorLocationJudge:
