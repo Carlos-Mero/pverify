@@ -5,7 +5,7 @@ import logging
 import random
 from pathlib import Path
 from datetime import datetime, timezone
-from litellm import acompletion, stream_chunk_builder
+from litellm import aresponses
 from tqdm import tqdm
 from datasets import load_dataset, Dataset, concatenate_datasets
 from utils.async_runner import AsyncLoopThread
@@ -313,6 +313,8 @@ def prepare_dataset(dataset_path, arxiv_data_dir=None):
     return ds
 
 class LLMClient():
+    MAX_RESPONSE_ATTEMPTS = 3
+
     def __init__(self, api_base, api_key, model):
         self.api_base = api_base
         self.api_key = api_key
@@ -326,17 +328,96 @@ class LLMClient():
         model_name = (self.model or "").lower()
         return "deepseek" in model_name or "qwen" in model_name
 
+    @staticmethod
+    def _field(value, name, default=None):
+        if isinstance(value, dict):
+            return value.get(name, default)
+        return getattr(value, name, default)
+
+    @classmethod
+    def _response_output_text(cls, response) -> str:
+        output_text = cls._field(response, "output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text
+
+        text_parts = []
+        for item in cls._field(response, "output", []) or []:
+            if cls._field(item, "type") != "message":
+                continue
+            for part in cls._field(item, "content", []) or []:
+                if cls._field(part, "type") != "output_text":
+                    continue
+                text = cls._field(part, "text")
+                if isinstance(text, str):
+                    text_parts.append(text)
+        return "".join(text_parts)
+
+    @classmethod
+    def _validate_completed_response(cls, response):
+        if response is None:
+            raise RuntimeError("Responses API returned no response")
+        if cls._field(response, "status") != "completed":
+            error = (
+                cls._field(response, "error")
+                or cls._field(response, "incomplete_details")
+            )
+            raise RuntimeError(
+                f"Responses API returned a non-completed response: {error}"
+            )
+        if not cls._response_output_text(response).strip():
+            raise RuntimeError(
+                "Responses API completed without final output_text"
+            )
+        return response
+
+    @classmethod
+    async def _consume_response_stream(cls, stream):
+        completed_response = None
+        async for event in stream:
+            event_type = cls._field(event, "type")
+            if event_type == "response.completed":
+                completed_response = cls._field(event, "response")
+            elif event_type in {"response.failed", "response.incomplete", "error"}:
+                error = cls._field(event, "error")
+                response = cls._field(event, "response")
+                if error is None and response is not None:
+                    error = (
+                        cls._field(response, "error")
+                        or cls._field(response, "incomplete_details")
+                    )
+                raise RuntimeError(
+                    f"Responses API stream ended with {event_type}: {error}"
+                )
+
+        if completed_response is None:
+            raise RuntimeError(
+                "Responses API stream ended without response.completed"
+            )
+        return cls._validate_completed_response(completed_response)
+
     async def _infer_one(self,
                          messages,
                          sem: asyncio.Semaphore,
                          **kwargs):
+        logger = logging.getLogger("evaluator")
         backoff = 1.0
-        while True:
+        last_error = None
+        reasoning_effort = kwargs.pop("reasoning_effort", None)
+        reasoning = (
+            {"effort": reasoning_effort}
+            if reasoning_effort is not None
+            else None
+        )
+        extra_body = dict(kwargs.pop("extra_body", {}) or {})
+        for provider_param in ("thinking", "enable_thinking"):
+            if provider_param in kwargs:
+                extra_body[provider_param] = kwargs.pop(provider_param)
+        for attempt in range(1, self.MAX_RESPONSE_ATTEMPTS + 1):
             try:
                 async with sem:
-                    stream = await acompletion(
+                    response_or_stream = await aresponses(
                         model="openai/"+self.model,
-                        messages=messages,
+                        input=messages,
                         api_base=self.api_base,
                         api_key=self.api_key,
                         drop_params=True,
@@ -344,21 +425,31 @@ class LLMClient():
                         timeout=3600,
                         num_retries=7,
                         stream=True,
-                        stream_options={"include_usage": True},
+                        store=False,
+                        reasoning=reasoning,
+                        extra_body=extra_body or None,
                         **kwargs)
-                    chunks = [chunk async for chunk in stream]
-                    resp = stream_chunk_builder(chunks=chunks, messages=messages)
-                    if resp is None:
-                        raise RuntimeError("Streaming response completed without any chunks")
-                return resp
+                    if hasattr(response_or_stream, "__aiter__"):
+                        return await self._consume_response_stream(
+                            response_or_stream
+                        )
+                    return self._validate_completed_response(response_or_stream)
             except Exception as e:
-                msg = str(e).lower()
-                if any(k in msg for k in ["rate", "timeout", "overloaded", "temporarily"]):
-                    await asyncio.sleep(backoff + random.random() * 0.2)
-                    backoff = min(backoff * 2, 60)
-                    continue
-                # raise
-                return None
+                last_error = e
+                if attempt >= self.MAX_RESPONSE_ATTEMPTS:
+                    break
+                logger.warning(
+                    "Responses API request failed on attempt %d/%d; retrying: %s",
+                    attempt,
+                    self.MAX_RESPONSE_ATTEMPTS,
+                    e,
+                )
+                await asyncio.sleep(backoff + random.random() * 0.2)
+                backoff = min(backoff * 2, 60)
+
+        raise RuntimeError(
+            f"Responses API request failed after {self.MAX_RESPONSE_ATTEMPTS} attempts"
+        ) from last_error
 
     async def infer_batch_async(self,
                                 all_messages,
@@ -398,9 +489,15 @@ class LLMClient():
             if isinstance(r, Exception):
                 raise RuntimeError(f"Task {i} failed") from r
         logger.info("completed batch inference on %d samples",  len(all_messages))
-        completions = [r.choices[0].message["content"] if r is not None else "" for r  in raw_results]
-        batch_input_tokens = [r.usage.prompt_tokens if r is not None else 0 for r in raw_results]
-        batch_comp_tokens = [r.usage.completion_tokens if r is not None else 0 for r in raw_results]
+        completions = [self._response_output_text(r) for r in raw_results]
+        batch_input_tokens = [
+            self._field(self._field(r, "usage"), "input_tokens", 0)
+            for r in raw_results
+        ]
+        batch_comp_tokens = [
+            self._field(self._field(r, "usage"), "output_tokens", 0)
+            for r in raw_results
+        ]
         self.last_input_tokens = batch_input_tokens
         self.last_comp_tokens = batch_comp_tokens
         self.input_tokens.extend(batch_input_tokens)
