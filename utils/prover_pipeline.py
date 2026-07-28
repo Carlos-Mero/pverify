@@ -95,7 +95,8 @@ class ProverPipeline:
             return await self.prover_client.infer_batch_async(
                 messages,
                 reasoning_effort=self.args.reasoning_effort,
-                enable_thinking=self.args.enable_thinking
+                enable_thinking=self.args.enable_thinking,
+                concurrency=self.args.concurrency,
             )
 
         # 2. Initial Proof Generation (or Resume)
@@ -181,6 +182,7 @@ class ProverPipeline:
                 eval_kwargs = {
                     "reasoning_effort": self.args.reasoning_effort,
                     "enable_thinking": self.args.enable_thinking,
+                    "concurrency": self.args.concurrency,
                 }
                 if self.reviewer_type in {"pessimistic", "ppruning"}:
                      eval_kwargs["ground_truth_labels"] = None

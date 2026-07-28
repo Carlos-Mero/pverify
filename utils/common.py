@@ -423,7 +423,10 @@ class LLMClient():
                         drop_params=True,
                         temperature=1.0,
                         timeout=3600,
-                        num_retries=7,
+                        # Keep retry policy in the outer loop only. Combining
+                        # LiteLLM retries with MAX_RESPONSE_ATTEMPTS multiplies
+                        # traffic during gateway outages.
+                        num_retries=0,
                         stream=True,
                         store=False,
                         reasoning=reasoning,
@@ -457,7 +460,13 @@ class LLMClient():
                                 show_progress: bool = True,
                                 **kwargs) -> list[str]:
         logger = logging.getLogger("evaluator")
-        logger.info("running batch inference on %d samples", len(all_messages))
+        if concurrency < 1:
+            raise ValueError("concurrency must be at least 1")
+        logger.info(
+            "running batch inference on %d samples with concurrency=%d",
+            len(all_messages),
+            concurrency,
+        )
         sem = asyncio.Semaphore(concurrency)
         ALLOWED_PARAM_KEYS = {"reasoning_effort", "thinking"}
         infer_params = {k: v for k, v in kwargs.items() if k in ALLOWED_PARAM_KEYS}

@@ -40,6 +40,7 @@ def main():
     common_parser.add_argument("-em", "--eval_model", help="the model used for evaluation (if needed)", default="")
     common_parser.add_argument("--log_dir", help="the logging directory path", default="eval_logs")
     common_parser.add_argument("--reasoning_effort", help="the reasoning_effort parameter for some models", default="medium", choices=["minimal", "low", "medium", "high"])
+    common_parser.add_argument("--concurrency", type=int, default=8, help="maximum number of concurrent API requests")
     common_parser.add_argument("--reviewer", default="standard", choices=["standard", "pessimistic", "vpessimistic", "progressive", "ppruning", "none"], help="the reviewer used for evaluation")
     common_parser.add_argument("--reviews", type=int, default=3, help="maximum reviews per sample for multi-review verifiers (pessimistic/ppruning)")
     common_parser.add_argument("--chunk_length", type=int, default=7, help="lines per chunk for vpessimistic reviewer")
@@ -234,6 +235,7 @@ def main():
             problems,
             reasoning_effort=args.reasoning_effort,
             enable_thinking=args.enable_thinking,
+            concurrency=args.concurrency,
         )
         striped_proofs = [strip_think_simple(proof) for proof in proofs]
         logger.info("successfully collected %d proofs from %s", len(proofs), args.proof_model)
@@ -267,6 +269,7 @@ def main():
     eval_call_kwargs = {
         "reasoning_effort": args.reasoning_effort,
         "enable_thinking": args.enable_thinking,
+        "concurrency": args.concurrency,
     }
     if args.reviewer in {"pessimistic", "ppruning"}:
         eval_call_kwargs["ground_truth_labels"] = preloaded_gt_labels
@@ -364,6 +367,7 @@ def main():
             list(preloaded_gt_texts),
             reasoning_effort=args.reasoning_effort,
             enable_thinking=args.enable_thinking,
+            concurrency=args.concurrency,
         )
         location_matches = [entry["matched"] for entry in location_judgments]
         verifier_eval["location_aware"] = compute_location_tnr(
